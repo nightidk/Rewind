@@ -18,9 +18,9 @@
         <span class="record-state"><span class="dot"></span><span id="global-state">Буфер выключен</span></span>
       </div>
       <div class="window-controls" aria-label="Управление окном">
-        <button type="button" class="window-control" data-window="minimize" aria-label="Свернуть" title="Свернуть"><span data-icon="minimize"></span></button>
-        <button type="button" class="window-control" data-window="toggleMaximize" aria-label="Развернуть или восстановить" title="Развернуть или восстановить"><span data-icon="maximize"></span></button>
-        <button type="button" class="window-control" data-window="close" aria-label="Закрыть" title="Закрыть"><span data-icon="close"></span></button>
+        <button type="button" class="window-control" data-window="minimize" aria-label="Свернуть" data-tooltip="Свернуть"><span data-icon="minimize"></span></button>
+        <button type="button" class="window-control" data-window="toggleMaximize" aria-label="Развернуть или восстановить" data-tooltip="Развернуть или восстановить"><span data-icon="maximize"></span></button>
+        <button type="button" class="window-control" data-window="close" aria-label="Закрыть" data-tooltip="Закрыть"><span data-icon="close"></span></button>
       </div>
     </header>
 
@@ -49,7 +49,7 @@
               <span class="record-state secondary"><span class="dot"></span><span id="local-state">Ожидает запуска</span></span>
             </header>
             <div class="clock"><strong id="elapsed">00:00</strong><span id="limit">/ 05:00</span></div>
-            <div class="plot" id="plot" role="meter" aria-label="Заполненность буфера" aria-valuemin="0" aria-valuemax="300" aria-valuenow="0" title="Каждая полоса показывает пиковую громкость захваченного звука за свой интервал">
+            <div class="plot" id="plot" role="meter" aria-label="Заполненность буфера" aria-valuemin="0" aria-valuemax="300" aria-valuenow="0" tabindex="0" data-tooltip="Каждая полоса показывает пиковую громкость захваченного звука за свой интервал">
               <div class="ticks" id="ticks" aria-hidden="true"></div>
               <div class="playhead" aria-hidden="true"></div>
             </div>
@@ -64,7 +64,7 @@
             <h2>Параметры записи</h2>
             <div class="readouts">
               <button type="button" data-page="video"><span data-icon="monitor"></span><span>Видео</span><strong id="summary-size">Как у экрана</strong><span data-icon="chevron"></span></button>
-              <button type="button" data-page="video" title="Фактические кадры в секунду / заданная частота"><span data-icon="layers"></span><span>Частота кадров</span><strong id="summary-fps">60 FPS</strong><span data-icon="chevron"></span></button>
+              <button type="button" data-page="video" data-tooltip="Фактические кадры в секунду / заданная частота"><span data-icon="layers"></span><span>Частота кадров</span><strong id="summary-fps">60 FPS</strong><span data-icon="chevron"></span></button>
               <button type="button" data-page="video"><span data-icon="chip"></span><span>Кодировщик</span><strong id="summary-encoder">H.264 · CPU</strong><span data-icon="chevron"></span></button>
               <button type="button" data-page="audio"><span data-icon="wave"></span><span>Аудиодорожки</span><strong id="summary-tracks">1</strong><span data-icon="chevron"></span></button>
             </div>
@@ -73,7 +73,7 @@
         </div>
         <div class="panel latest" id="latest">
           <span data-icon="film"></span><h2>Последний клип</h2>
-          <span id="last-file">Сохранённые повторы появятся здесь</span>
+          <span id="last-file" data-tooltip="">Сохранённые повторы появятся здесь</span>
           <button type="button" class="pill" id="open-clip" data-action="open_clip" hidden>Открыть</button>
         </div>
         <p class="hint buffer-hint" id="shortcut-warning" hidden>Горячая клавиша занята. Выберите другую в разделе «Видео».</p>
@@ -88,7 +88,7 @@
               <label class="switch-label wide"><input class="switch" type="checkbox" name="automatic_capture" checked>Автоматический захват с ускорением GPU</label>
               <label id="mode-field">Способ захвата<select name="mode"><option value="dxgi">DXGI</option><option value="gdi">Совместимый (GDI)</option></select></label>
               <label id="dxgi-field">Выход DXGI<input type="number" name="dxgi_display" min="0" max="31" required></label>
-              <label id="gdi-field" hidden>Монитор<select name="gdi_display"></select></label>
+              <label id="gdi-field" class="wide" hidden>Монитор<select name="gdi_display"></select></label>
               <label class="switch-label wide"><input class="switch" type="checkbox" name="native_resolution">Родное разрешение экрана</label>
               <label id="width-field" hidden>Ширина, px<input type="number" name="width" min="160" max="7680" step="2" required></label>
               <label id="height-field" hidden>Высота, px<input type="number" name="height" min="120" max="4320" step="2" required></label>
@@ -104,8 +104,16 @@
               <label>Длительность, сек.<input type="number" name="seconds" min="10" max="1800" required></label>
               <label>Горячая клавиша<select name="shortcut"><option value="6">Alt + F6</option><option value="7">Alt + F7</option><option value="8">Alt + F8</option><option value="9">Alt + F9</option><option value="10">Alt + F10</option><option value="11">Alt + F11</option></select></label>
               <label class="wide">Кодек сохранённого видео<select name="export_codec"><option value="h264">H.264 · без перекодирования</option><option value="hevc">H.265 / HEVC</option><option value="av1">AV1</option></select></label>
-              <label class="wide">Папка клипов<input name="output" type="text" spellcheck="false" required></label>
-              <label class="wide">Путь к FFmpeg<input name="ffmpeg" type="text" spellcheck="false" placeholder="Найти или скачать автоматически"></label>
+              <div class="path-control wide">
+                <label for="clip-folder">Папка клипов</label>
+                <input id="clip-folder" name="output" type="text" spellcheck="false" required>
+                <button type="button" class="pill browse" data-browse="output" aria-label="Выбрать папку клипов">Обзор…</button>
+              </div>
+              <div class="path-control wide">
+                <label for="ffmpeg-path">Путь к FFmpeg</label>
+                <input id="ffmpeg-path" name="ffmpeg" type="text" spellcheck="false" placeholder="Найти автоматически">
+                <button type="button" class="pill browse" data-browse="ffmpeg" aria-label="Выбрать FFmpeg">Обзор…</button>
+              </div>
             </fieldset>
             <p class="hint" id="storage"></p>
           </article>
@@ -145,21 +153,45 @@
           <div class="fields">
             <label>Язык интерфейса<select name="language"><option value="system">Как в Windows</option><option value="ru">Русский</option><option value="en">English</option></select></label>
             <label>При закрытии окна<select name="close_behavior"><option value="ask">Спрашивать</option><option value="tray">Свернуть в трей</option><option value="exit">Выйти из Rewind</option></select></label>
+            <label>Масштаб интерфейса<select name="interface_scale"><option value="80">80%</option><option value="90">90%</option><option value="100" selected>100%</option><option value="110">110%</option><option value="125">125%</option><option value="150">150%</option></select></label>
+            <div class="startup-setting wide">
+              <label class="switch-label"><input class="switch" type="checkbox" name="start_with_windows" aria-describedby="startup-hint">Запускать с Windows</label>
+              <p class="hint" id="startup-hint">При входе в Windows буфер включится снова, если он был активен.</p>
+            </div>
           </div>
-          <div class="preferences-status"><span id="app-version"></span><output id="preferences-feedback" role="status"></output></div>
+          <div class="preferences-status">
+            <div class="preferences-meta">
+              <span id="app-version"></span>
+              <button type="button" class="pill repository" data-action="open_repository" aria-label="Репозиторий Rewind на GitHub">GitHub <span aria-hidden="true">↗</span></button>
+            </div>
+            <output id="preferences-feedback" role="status"></output>
+          </div>
         </div>
       </section>
     </main>
   </div>
-  <dialog id="close-prompt" aria-labelledby="close-title" aria-describedby="close-description">
+  <div id="tooltip" role="tooltip" popover="manual"></div>
+  <dialog id="close-prompt" class="prompt" aria-labelledby="close-title" aria-describedby="close-description">
     <form method="dialog">
       <h2 id="close-title">Закрыть Rewind?</h2>
-      <p class="hint" id="close-description">При сворачивании в трей запись продолжится. При выходе временный буфер удалится.</p>
+      <p class="hint prompt-description" id="close-description">При сворачивании в трей запись продолжится. При выходе временный буфер удалится.</p>
       <label class="remember-close"><input type="checkbox" name="remember_close">Запомнить выбор</label>
-      <div class="close-actions">
+      <div class="prompt-actions">
         <button type="submit" class="pill" value="cancel" autofocus>Отмена</button>
         <button type="submit" class="pill" value="exit">Выйти</button>
         <button type="submit" class="pill primary" value="tray">Свернуть в трей</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="ffmpeg-prompt" class="prompt" aria-labelledby="ffmpeg-title" aria-describedby="ffmpeg-description">
+    <form method="dialog">
+      <h2 id="ffmpeg-title">FFmpeg не найден</h2>
+      <p class="hint prompt-description" id="ffmpeg-description">Для записи скачайте FFmpeg или выберите установленный файл ffmpeg.exe.</p>
+      <p class="hint prompt-error" id="ffmpeg-prompt-error" role="alert"></p>
+      <div class="prompt-actions">
+        <button type="submit" class="pill" value="exit">Выйти</button>
+        <button type="submit" class="pill" value="path" autofocus>Указать путь</button>
+        <button type="submit" class="pill primary" value="download">Скачать</button>
       </div>
     </form>
   </dialog>

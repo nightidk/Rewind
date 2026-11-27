@@ -33,11 +33,24 @@ impl Language {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
     pub language: Language,
     pub close_behavior: CloseBehavior,
+    pub interface_scale: u16,
+    pub start_with_windows: bool,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            language: Language::default(),
+            close_behavior: CloseBehavior::default(),
+            interface_scale: 100,
+            start_with_windows: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +110,7 @@ pub struct Track {
 #[serde(default)]
 pub struct Settings {
     pub preferences: Preferences,
+    pub resume_buffer: bool,
     pub seconds: u32,
     pub shortcut: u32,
     pub output: PathBuf,
@@ -124,6 +138,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             preferences: Preferences::default(),
+            resume_buffer: false,
             seconds: 300,
             shortcut: 10,
             output: dirs::video_dir()
@@ -252,5 +267,7 @@ fn legacy_profile_defaults_to_windows_language_and_the_close_prompt() -> Result<
     assert_eq!(settings.shortcut, 8);
     assert_eq!(settings.preferences.language, Language::System);
     assert_eq!(settings.preferences.close_behavior, CloseBehavior::Ask);
+    assert!(!settings.preferences.start_with_windows);
+    assert!(!settings.resume_buffer);
     Ok(())
 }

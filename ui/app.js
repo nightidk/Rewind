@@ -1,6 +1,5 @@
 import { language, localize, t } from "./i18n.js";
-
-localize("ru");
+import { setupTooltips } from "./tooltips.js";
 
 const icons = {
   rewind: '<path fill="currentColor" stroke="none" d="M11 5v14L2 12l9-7Zm10 0v14l-9-7 9-7Z"/>',
@@ -23,6 +22,7 @@ const icons = {
 const $ = (selector) => document.querySelector(selector);
 const all = (selector) => [...document.querySelectorAll(selector)];
 const field = (name) => $("[name=" + name + "]");
+const preferenceNames = ["language", "close_behavior", "interface_scale"];
 const onText = (selector, value) => {
   const element = $(selector);
   if (element.textContent !== value) element.textContent = value;
@@ -49,6 +49,7 @@ let limit = 0;
 let page = "buffer";
 let dirty = false;
 let applying = false;
+let browsing = false;
 let pendingAction = false;
 let initialized = false;
 let lastStatus;
@@ -235,6 +236,43 @@ function edit(event) {
   refreshControls();
 }
 
+function setupNumberFields() {
+  for (const input of all('input[type="number"]')) {
+    const label = input.parentElement;
+    const field = document.createElement("div");
+    field.className = "number-control";
+    if (label.id) {
+      field.id = label.id;
+      label.removeAttribute("id");
+    }
+    field.hidden = label.hidden;
+    label.hidden = false;
+    input.id = "number-" + input.name;
+    label.htmlFor = input.id;
+
+    const stepper = document.createElement("div");
+    stepper.className = "number-field";
+    for (const [symbol, description, method] of [
+      ["−", "Уменьшить значение", "stepDown"],
+      ["+", "Увеличить значение", "stepUp"],
+    ]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = symbol;
+      button.setAttribute("aria-label", description);
+      button.addEventListener("click", () => {
+        const previous = input.value;
+        input[method]();
+        if (input.value !== previous) input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      stepper.append(button);
+    }
+    stepper.insertBefore(input, stepper.lastElementChild);
+    label.replaceWith(field);
+    field.append(label, stepper);
+  }
+}
+
 function apply() {
   if (locked()) return;
   for (const control of all(".editable input, .editable select")) {
@@ -260,6 +298,31 @@ function apply() {
   feedback(t("Сохраняем настройки…"));
   refreshControls();
   ipc("apply", { settings: next });
+}
+
+async function pickPath(kind) {
+  if (browsing) return null;
+  browsing = true;
+  try {
+    return await window.__TAURI__.core.invoke("browse_path", { kind, current: field(kind).value.trim() });
+  } finally {
+    browsing = false;
+  }
+}
+
+async function browsePath(kind) {
+  if (locked()) return;
+  const input = field(kind);
+  try {
+    const path = await pickPath(kind);
+    if (path && !locked() && path !== input.value) {
+      input.value = path;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  } catch (error) {
+    console.error(error);
+    feedback(t("Не удалось открыть диалог выбора."));
+  }
 }
 
 function plot(state, maximum) {
@@ -307,8 +370,8 @@ function plot(state, maximum) {
 
 window.rewind = {
   preferences({ preferences, locale, tray, version }) {
-    field("language").value = preferences.language;
-    field("close_behavior").value = preferences.close_behavior;
+    for (const name of preferenceNames) field(name).value = preferences[name];
+    field("start_with_windows").checked = preferences.start_with_windows;
     field("close_behavior").querySelector('option[value="tray"]').disabled = !tray;
     onText("#app-version", "v" + version);
     if (locale === language()) return;
@@ -338,6 +401,18 @@ window.rewind = {
     field("remember_close").checked = false;
     dialog.querySelector('[value="tray"]').disabled = !tray;
     dialog.showModal();
+  },
+  ffmpegPrompt() {
+    const dialog = $("#ffmpeg-prompt");
+    if (dialog.open) return;
+    pendingAction = true;
+    refreshControls();
+    onText("#ffmpeg-prompt-error", "");
+    dialog.showModal();
+  },
+  ffmpegPath(path) {
+    settings.ffmpeg = path;
+    field("ffmpeg").value = path;
   },
   configure(config) {
     settings = config.settings;
@@ -416,7 +491,9 @@ window.rewind = {
     if (state.last !== last || !initialized) {
       $("#open-clip").hidden = !state.last;
       onText("#last-file", state.last?.split(/[\\/]/).at(-1) ?? t("Сохранённые повторы появятся здесь"));
-      $("#last-file").title = state.last ?? "";
+      $("#last-file").dataset.tooltip = state.last ?? "";
+      if (state.last) $("#last-file").tabIndex = 0;
+      else $("#last-file").removeAttribute("tabindex");
       if (initialized && state.last) {
         const latest = $("#latest");
         latest.classList.remove("saved");
@@ -443,6 +520,7 @@ document.addEventListener("click", (event) => {
   }
   if (button.dataset.page) goto(button.dataset.page, !button.matches(".tab"));
   if (button.dataset.action) ipc(button.dataset.action);
+  if (button.dataset.browse) void browsePath(button.dataset.browse);
   if (button.id === "primary" && button.dataset.command) {
     pendingAction = true;
     button.disabled = true;
@@ -460,10 +538,15 @@ document.addEventListener("input", (event) => {
 field("mode").addEventListener("change", mode);
 field("automatic_capture").addEventListener("change", mode);
 field("native_resolution").addEventListener("change", resolutionMode);
-for (const name of ["language", "close_behavior"]) {
+for (const name of [...preferenceNames, "start_with_windows"]) {
   field(name).addEventListener("change", () => {
     onText("#preferences-feedback", t("Сохраняем настройки…"));
-    ipc("preferences", { preferences: { language: field("language").value, close_behavior: field("close_behavior").value } });
+    ipc("preferences", { preferences: {
+      language: field("language").value,
+      close_behavior: field("close_behavior").value,
+      interface_scale: Number(field("interface_scale").value),
+      start_with_windows: field("start_with_windows").checked,
+    } });
   });
 }
 $("#close-prompt form").addEventListener("submit", (event) => {
@@ -476,4 +559,31 @@ $("#close-prompt").addEventListener("close", (event) => {
     ipc("close_choice", { behavior, remember: field("remember_close").checked });
   }
 });
+const ffmpegPrompt = $("#ffmpeg-prompt");
+ffmpegPrompt.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (browsing) return;
+  const choice = event.submitter.value;
+  let path;
+  if (choice === "path") {
+    onText("#ffmpeg-prompt-error", "");
+    try {
+      path = await pickPath("ffmpeg");
+    } catch (error) {
+      console.error(error);
+      onText("#ffmpeg-prompt-error", t("Не удалось открыть диалог выбора."));
+      return;
+    }
+    if (!path || !ffmpegPrompt.open) return;
+  }
+  ffmpegPrompt.close();
+  ipc("ffmpeg_choice", { choice, path });
+});
+ffmpegPrompt.addEventListener("cancel", () => {
+  pendingAction = false;
+  ipc("ffmpeg_choice", { choice: "cancel" });
+});
+setupNumberFields();
+localize("ru");
+setupTooltips();
 ipc("ready");

@@ -1,6 +1,6 @@
 {
   "productName": "Rewind",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "identifier": "Rewind.Replay",
   "build": { "frontendDist": "ui" },
   "app": {
@@ -10,5 +10,10 @@
       "csp": "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost; base-uri 'none'; form-action 'none'"
     }
   },
-  "bundle": { "active": false, "icon": ["assets/rewind.ico"] }
+  "bundle": {
+    "active": false,
+    "publisher": "nightidk",
+    "copyright": "© 2026 nightidk",
+    "icon": ["assets/rewind.ico"]
+  }
 }

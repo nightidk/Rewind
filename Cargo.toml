@@ -1,6 +1,6 @@
 [package]
 name = "rewind"
-version = "0.2.0"
+version = "0.3.0"
 description = "Instant replay for Windows"
 repository = "https://github.com/nightidk/Rewind"
 edition = "2024"
@@ -39,6 +39,7 @@ windows = { version = "0.61.3", features = [
     "Win32_System_Variant",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell_Common",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }

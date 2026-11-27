@@ -4,11 +4,14 @@ mod audio;
 mod ffmpeg;
 mod localization;
 mod overlay;
+mod path_picker;
 mod recorder;
 mod settings;
+mod startup;
 mod tray_panel;
 mod window_events;
 
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -34,7 +37,7 @@ use tauri::{
     WindowEvent,
 };
 use tray_panel::TrayPanel;
-use windows::Win32::Foundation::{ERROR_CANCELLED, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{ERROR_CANCELLED, ERROR_SHARING_VIOLATION, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
@@ -57,6 +60,10 @@ use windows::core::{HSTRING, PCWSTR, w};
 enum Request {
     Ready,
     Start,
+    FfmpegChoice {
+        #[serde(flatten)]
+        choice: FfmpegChoice,
+    },
     Stop,
     Save,
     Apply {
@@ -65,6 +72,7 @@ enum Request {
     RefreshDevices,
     OpenFolder,
     OpenClip,
+    OpenRepository,
     Preferences {
         preferences: Preferences,
     },
@@ -72,6 +80,15 @@ enum Request {
         behavior: CloseBehavior,
         remember: bool,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "choice", rename_all = "snake_case")]
+enum FfmpegChoice {
+    Download,
+    Path { path: PathBuf },
+    Exit,
+    Cancel,
 }
 
 enum AppEvent {
@@ -260,12 +277,12 @@ fn show_notification(title: &str, message: &str, flags: u32) -> windows::core::R
     }
 }
 
-fn launch(path: &Path) -> Result<()> {
+fn launch(target: &OsStr) -> Result<()> {
     let result = unsafe {
         ShellExecuteW(
             None,
             PCWSTR::null(),
-            &HSTRING::from(path.as_os_str()),
+            &HSTRING::from(target),
             PCWSTR::null(),
             PCWSTR::null(),
             SW_SHOWNORMAL,
@@ -274,7 +291,7 @@ fn launch(path: &Path) -> Result<()> {
     ensure!(
         result.0 as isize > 32,
         "Не удалось открыть {}",
-        path.display()
+        target.to_string_lossy()
     );
     Ok(())
 }
@@ -295,9 +312,21 @@ fn close(window: &WebviewWindow, behavior: CloseBehavior, quitting: &mut bool) -
 }
 
 fn save_preferences(directory: &Path, settings: &mut Settings, next: Preferences) -> Result<()> {
-    let previous = std::mem::replace(&mut settings.preferences, next);
+    anyhow::ensure!(
+        [80, 90, 100, 110, 125, 150].contains(&next.interface_scale),
+        "Недопустимый масштаб интерфейса"
+    );
+    let previous = settings.preferences;
+    let startup_changed = previous.start_with_windows != next.start_with_windows;
+    if startup_changed {
+        startup::set_enabled(next.start_with_windows)?;
+    }
+    settings.preferences = next;
     if let Err(error) = settings.write(directory) {
         settings.preferences = previous;
+        if startup_changed {
+            startup::set_enabled(previous.start_with_windows)?;
+        }
         return Err(error).context("Не удалось сохранить настройки");
     }
     Ok(())
@@ -334,8 +363,18 @@ fn open_buffers(directory: &Path) -> Result<PathBuf> {
 }
 
 fn run() -> Result<()> {
-    let (directory, lock) = open_data()?;
-    let buffers = open_buffers(&directory)?;
+    let windows_startup = std::env::args_os().any(|arg| arg == startup::ARGUMENT);
+    let (directory, lock) = match open_data() {
+        Err(error)
+            if windows_startup
+                && error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                    error.raw_os_error() == Some(ERROR_SHARING_VIOLATION.0 as i32)
+                }) =>
+        {
+            return Ok(());
+        }
+        result => result?,
+    };
     let (mut settings, load_error) = match Settings::load(&directory).and_then(|settings| {
         settings.validate()?;
         Ok(settings)
@@ -346,6 +385,10 @@ fn run() -> Result<()> {
             Some(format!("{error:#}. Проверьте настройки перед записью.")),
         ),
     };
+    if windows_startup && !settings.preferences.start_with_windows {
+        return Ok(());
+    }
+    let buffers = open_buffers(&directory)?;
     let mut recorder = Recorder::default();
     recorder.last = last_clip(&settings.output);
     recorder.error = load_error;
@@ -353,7 +396,11 @@ fn run() -> Result<()> {
     let (proxy, incoming) = mpsc::channel();
     let app = tauri::Builder::default()
         .manage(proxy.clone())
-        .invoke_handler(tauri::generate_handler![dispatch, tray_action])
+        .invoke_handler(tauri::generate_handler![
+            dispatch,
+            tray_action,
+            path_picker::browse_path
+        ])
         .build(tauri::generate_context!())?;
     let webview_data = directory.join("webview");
     let view = WebviewWindowBuilder::new(&app, "main", WebviewUrl::App("index.html".into()))
@@ -486,9 +533,16 @@ fn run() -> Result<()> {
     let mut close_pending = false;
     let mut quitting = false;
     let mut overlay = Overlay::new().ok();
+    let mut awaiting_ffmpeg = false;
     let mut downloading: Option<Arc<AtomicBool>> = None;
+    let mut start_on_ready = windows_startup && settings.resume_buffer;
+    let mut buffer_active = false;
     app.run_return(move |app, event| {
         let _ = (&lock, &window_events, &keep_ticking);
+        let start_capture = |recorder: &mut Recorder, displays: &mut Vec<Display>, settings: &Settings| {
+            *displays = monitors();
+            recorder.start(&buffers, settings, displays, false)
+        };
         if let RunEvent::WindowEvent { label, event: WindowEvent::CloseRequested { api, .. }, .. } = event {
             api.prevent_close();
             let event = if label == "tray" { AppEvent::DismissTray } else { AppEvent::CloseMain };
@@ -497,6 +551,7 @@ fn run() -> Result<()> {
         for event in incoming.try_iter() {
             let locale = settings.preferences.language.resolve();
             let send_preferences = |settings: &Settings| {
+                let _ = view.set_zoom(f64::from(settings.preferences.interface_scale) / 100.0);
                 ipc(&view, "preferences", &json!({
                     "preferences": settings.preferences,
                     "locale": settings.preferences.language.resolve(),
@@ -515,7 +570,8 @@ fn run() -> Result<()> {
             let due = matches!(event, AppEvent::Tick);
             let capture_action = matches!(
                 &event,
-                AppEvent::Request(Request::Start | Request::Stop) | AppEvent::FfmpegInstalled(_)
+                AppEvent::Request(Request::Start | Request::Stop | Request::FfmpegChoice { choice: FfmpegChoice::Download | FfmpegChoice::Path { .. } })
+                    | AppEvent::FfmpegInstalled(_)
             );
             let result = match event {
                 AppEvent::TrayMenu(position) => {
@@ -570,8 +626,7 @@ fn run() -> Result<()> {
                     if !quitting && !cancelled {
                         let mut capture = settings.clone();
                         capture.ffmpeg = result?;
-                        displays = monitors();
-                        recorder.start(&buffers, &capture, &displays, false)?;
+                        start_capture(&mut recorder, &mut displays, &capture)?;
                     }
                     Ok(())
                 })(),
@@ -595,8 +650,14 @@ fn run() -> Result<()> {
                             send_preferences(&settings);
                             send_settings(&settings, &displays, shortcut);
                             audio_devices(&proxy);
+                            if awaiting_ffmpeg {
+                                ipc(&view, "ffmpegPrompt", &true);
+                            }
                             if std::mem::take(&mut close_pending) {
                                 ipc(&view, "closePrompt", &tray.is_some());
+                            }
+                            if std::mem::take(&mut start_on_ready) {
+                                let _ = proxy.send(AppEvent::Request(Request::Start));
                             }
                         }
                         Request::Preferences { preferences } => {
@@ -619,22 +680,44 @@ fn run() -> Result<()> {
                             close(&view, behavior, &mut quitting)?;
                         }
                         Request::Start => {
-                            if downloading.is_none() && !quitting {
+                            if downloading.is_none() && !awaiting_ffmpeg && !quitting {
                                 ensure!(recorder.can_configure(), "Сначала остановите текущую запись.");
                                 if let Some(path) = ffmpeg::find(&settings.ffmpeg, &directory) {
                                     let mut capture = settings.clone();
                                     capture.ffmpeg = path;
-                                    displays = monitors();
-                                    recorder.start(&buffers, &capture, &displays, false)?;
+                                    start_capture(&mut recorder, &mut displays, &capture)?;
                                 } else {
                                     recorder.error = None;
-                                    let stop = Arc::new(AtomicBool::new(false));
-                                    downloading = Some(Arc::clone(&stop));
-                                    let proxy = proxy.clone();
-                                    let directory = directory.clone();
-                                    std::thread::spawn(move || {
-                                        let _ = proxy.send(AppEvent::FfmpegInstalled(ffmpeg::install(&directory, &stop)));
-                                    });
+                                    awaiting_ffmpeg = true;
+                                    ipc(&view, "ffmpegPrompt", &true);
+                                }
+                            }
+                        }
+                        Request::FfmpegChoice { choice } => {
+                            if std::mem::take(&mut awaiting_ffmpeg) && !quitting {
+                                match choice {
+                                    FfmpegChoice::Cancel => {}
+                                    FfmpegChoice::Exit => quitting = true,
+                                    FfmpegChoice::Download => {
+                                        ensure!(recorder.can_configure(), "Сначала дождитесь остановки записи или сохранения клипа.");
+                                        let stop = Arc::new(AtomicBool::new(false));
+                                        downloading = Some(Arc::clone(&stop));
+                                        let proxy = proxy.clone();
+                                        let directory = directory.clone();
+                                        std::thread::spawn(move || {
+                                            let _ = proxy.send(AppEvent::FfmpegInstalled(ffmpeg::install(&directory, &stop)));
+                                        });
+                                    }
+                                    FfmpegChoice::Path { path } => {
+                                        ensure!(recorder.can_configure(), "Сначала дождитесь остановки записи или сохранения клипа.");
+                                        ensure!(path.is_absolute() && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe")) && path.is_file(), "Укажите существующий файл ffmpeg.exe.");
+                                        let mut next = settings.clone();
+                                        next.ffmpeg = path;
+                                        next.write(&directory).context("Не удалось сохранить настройки")?;
+                                        settings.ffmpeg = next.ffmpeg;
+                                        ipc(&view, "ffmpegPath", &settings.ffmpeg);
+                                        start_capture(&mut recorder, &mut displays, &settings)?;
+                                    }
                                 }
                             }
                         }
@@ -648,6 +731,7 @@ fn run() -> Result<()> {
                         Request::Apply { settings: mut next } => {
                             ensure!(downloading.is_none() && recorder.can_configure(), "Остановите запись и дождитесь завершения текущей операции.");
                             next.preferences = settings.preferences;
+                            next.resume_buffer = settings.resume_buffer;
                             next.validate()?;
                             let changed = next.shortcut != settings.shortcut;
                             let newly_registered = (changed || !shortcut) && register_shortcut(hwnd, next.shortcut);
@@ -668,9 +752,10 @@ fn run() -> Result<()> {
                         Request::RefreshDevices => audio_devices(&proxy),
                         Request::OpenFolder => {
                             fs::create_dir_all(&settings.output)?;
-                            launch(&settings.output)?;
+                            launch(settings.output.as_os_str())?;
                         }
-                        Request::OpenClip => launch(recorder.last.as_deref().context("Сначала сохраните клип.")?)?,
+                        Request::OpenClip => launch(recorder.last.as_deref().context("Сначала сохраните клип.")?.as_os_str())?,
+                        Request::OpenRepository => launch(OsStr::new(env!("CARGO_PKG_REPOSITORY")))?,
                         Request::Save => {}
                     }
                     Ok(())
@@ -705,6 +790,15 @@ fn run() -> Result<()> {
                 ipc(&view, "rejected", &true);
             }
             let mut status = recorder.status();
+            let active = matches!(status.phase, "starting" | "recording");
+            if active != buffer_active {
+                buffer_active = active;
+                settings.resume_buffer = active;
+                if let Err(error) = settings.write(&directory) {
+                    recorder.error = Some(format!("Не удалось запомнить состояние буфера: {error:#}"));
+                    status = recorder.status();
+                }
+            }
             if let Some(stop) = &downloading {
                 if quitting { stop.store(true, Ordering::Relaxed); }
                 status.phase = "downloading";
