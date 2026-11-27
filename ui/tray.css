@@ -1,0 +1,25 @@
+.tray { min-width: 0; height: 100vh; overflow: hidden; background: var(--surface); border: 1px solid var(--line); border-radius: 4px; }
+.tray-panel { display: flex; flex-direction: column; gap: 9px; padding: 13px; outline: none; }
+.tray-header, .tray-readout { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.tray .identity { gap: 8px; }
+.tray .mark { width: 28px; height: 28px; }
+.tray .mark svg { width: 16px; height: 16px; }
+.tray .brand { font-size: 22px; letter-spacing: -1px; }
+.tray .record-state { gap: 6px; font-size: 12px; }
+.tray .dot { width: 6px; height: 6px; }
+.tray-buffer { padding: 9px 11px; background: var(--raised); border: 1px solid var(--line); border-radius: 4px; }
+.tray-readout { margin-bottom: 7px; color: var(--muted); font-size: 12px; }
+.tray-readout > div { display: flex; align-items: baseline; gap: 7px; font-variant-numeric: tabular-nums; }
+.tray-readout strong { color: var(--text); font-size: 23px; line-height: 1; font-weight: 600; letter-spacing: -1px; }
+.tray progress { display: block; appearance: none; width: 100%; height: 5px; border: 0; }
+.tray progress::-webkit-progress-bar { background: var(--line); border-radius: 2px; }
+.tray progress::-webkit-progress-value { background: var(--green); border-radius: 2px; transition: width 220ms ease-out; }
+.tray .tray-save { min-height: 37px; font-size: 13px; }
+.tray-save kbd { color: #404349; border-color: #a1a4ab; padding-inline: 5px; }
+.tray-actions { display: flex; gap: 8px; }
+.tray-actions .pill { min-height: 32px; font-size: 12px; }
+.tray-actions .pill:first-child { flex: 1; }
+.tray-actions .pill:last-child { color: var(--muted); }
+@media (prefers-reduced-motion: reduce) {
+  .tray progress::-webkit-progress-value { transition: none; }
+}

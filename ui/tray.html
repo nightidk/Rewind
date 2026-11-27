@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Меню Rewind</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/tray.css">
+  <script type="module" src="/tray.js"></script>
+</head>
+<body class="tray">
+  <main class="tray-panel" tabindex="-1" aria-label="Меню Rewind">
+    <header class="tray-header">
+      <div class="identity">
+        <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M11 5v14L2 12l9-7Zm10 0v14l-9-7 9-7Z"/></svg></span>
+        <span class="brand">rewind<span>.</span></span>
+      </div>
+      <span class="record-state"><span class="dot" aria-hidden="true"></span><span id="record-state" role="status">Буфер выключен</span></span>
+    </header>
+    <div class="tray-buffer">
+      <div class="tray-readout">
+        <label for="buffer">Буфер</label>
+        <div><strong id="elapsed">00:00</strong><span id="limit">/ 05:00</span></div>
+      </div>
+      <progress id="buffer" value="0" max="300"></progress>
+    </div>
+    <button type="button" class="pill primary tray-save" data-action="save" disabled>
+      <span id="save-label">Сохранить повтор</span><kbd id="shortcut" hidden></kbd>
+    </button>
+    <footer class="tray-actions">
+      <button type="button" class="pill" data-action="open">Открыть Rewind</button>
+      <button type="button" class="pill" data-action="quit">Выйти</button>
+    </footer>
+  </main>
+</body>
+</html>

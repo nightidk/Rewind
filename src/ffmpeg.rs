@@ -1,0 +1,171 @@
+use std::ffi::OsString;
+use std::fs::{self, File};
+use std::io::{self, BufReader};
+use std::os::windows::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use anyhow::{Context, Result, ensure};
+use sha2::{Digest, Sha256};
+use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+use crate::recorder::{Process, command};
+
+const URLS: [&str; 2] = [
+    "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.1-essentials_build.7z",
+    "https://github.com/GyanD/codexffmpeg/releases/download/9.1/ffmpeg-9.1-essentials_build.7z",
+];
+const SHA256: &str = "835b9a733445ba7a56a37a26cf7bde84e2f3ce7da2a8ec984276bb2abb1b922c";
+const ENTRY: &str = "ffmpeg-9.1-essentials_build/bin/ffmpeg.exe";
+
+pub fn find(preferred: &Path, data: &Path) -> Option<PathBuf> {
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("ffmpeg.exe")));
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    [Some(preferred.to_owned()), beside]
+        .into_iter()
+        .flatten()
+        .chain(
+            std::env::split_paths(&path)
+                .filter(|dir| dir.is_absolute())
+                .map(|dir| dir.join("ffmpeg.exe")),
+        )
+        .chain([data.join("tools").join("ffmpeg.exe")])
+        .find(|path| path.is_file())
+}
+
+fn system_directory() -> Result<PathBuf> {
+    let mut buffer = [0; 1024];
+    let len = unsafe { GetSystemDirectoryW(Some(&mut buffer)) as usize };
+    ensure!(
+        len > 0 && len < buffer.len(),
+        "Не удалось найти системную папку Windows."
+    );
+    Ok(OsString::from_wide(&buffer[..len]).into())
+}
+
+fn run(command: &mut Command, stop: &AtomicBool) -> Result<()> {
+    ensure!(!stop.load(Ordering::Relaxed), "Установка FFmpeg отменена.");
+    let mut process = Process::start(command)?;
+    while !stop.load(Ordering::Relaxed) {
+        if let Some(status) = process.child.try_wait()? {
+            ensure!(status.success(), "Код завершения {status}.");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::bail!("Установка FFmpeg отменена.")
+}
+
+fn download(curl: &Path, archive: &Path, log: &Path, stop: &AtomicBool) -> Result<()> {
+    for url in URLS {
+        ensure!(!stop.load(Ordering::Relaxed), "Установка FFmpeg отменена.");
+        let result = run(
+            command(curl)
+                .args([
+                    "--disable",
+                    "--silent",
+                    "--show-error",
+                    "--fail",
+                    "--location",
+                    "--proto",
+                    "=https",
+                    "--proto-redir",
+                    "=https",
+                    "--connect-timeout",
+                    "15",
+                    "--max-time",
+                    "300",
+                    "--speed-limit",
+                    "1024",
+                    "--speed-time",
+                    "25",
+                    "--max-filesize",
+                    "50000000",
+                    "--output",
+                ])
+                .arg(archive)
+                .arg(url)
+                .stdout(Stdio::null())
+                .stderr(File::create(log)?)
+                .stdin(Stdio::null()),
+            stop,
+        );
+        if result.is_ok() {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "Не удалось скачать FFmpeg. Проверьте соединение и попробуйте снова. {}",
+        fs::read_to_string(log).unwrap_or_default().trim()
+    )
+}
+
+pub fn install(data: &Path, stop: &AtomicBool) -> Result<PathBuf> {
+    let system = system_directory()?;
+    let tools = data.join("tools");
+    fs::create_dir_all(&tools).context("Не удалось создать папку для FFmpeg")?;
+    let work = tempfile::Builder::new()
+        .prefix("ffmpeg-")
+        .tempdir_in(&tools)?;
+    let archive = work.path().join("ffmpeg.7z");
+    download(
+        &system.join("curl.exe"),
+        &archive,
+        &work.path().join("download.log"),
+        stop,
+    )?;
+    let mut hash = Sha256::new();
+    io::copy(&mut BufReader::new(File::open(&archive)?), &mut hash)?;
+    ensure!(
+        format!("{:x}", hash.finalize()) == SHA256,
+        "Контрольная сумма архива FFmpeg не совпала. Загрузка отклонена."
+    );
+
+    let executable = tempfile::Builder::new()
+        .suffix(".exe")
+        .tempfile_in(&tools)?;
+    run(
+        command(&system.join("tar.exe"))
+            .args(["-xOf"])
+            .arg(&archive)
+            .arg(ENTRY)
+            .stdout(executable.reopen()?)
+            .stderr(Stdio::null())
+            .stdin(Stdio::null()),
+        stop,
+    )
+    .context("Не удалось извлечь ffmpeg.exe из архива")?;
+    ensure!(
+        executable.as_file().metadata()?.len() > 0,
+        "Распакованный ffmpeg.exe пуст."
+    );
+    executable.as_file().sync_all()?;
+    ensure!(!stop.load(Ordering::Relaxed), "Установка FFmpeg отменена.");
+    let destination = tools.join("ffmpeg.exe");
+    executable.persist_noclobber(&destination)?;
+    Ok(destination)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "downloads the pinned archive over HTTPS"]
+    fn installs_pinned_build_in_app_directory() -> Result<()> {
+        let temp = tempfile::tempdir_in(std::env::current_dir()?.join("target"))?;
+        let path = install(&temp.path().canonicalize()?, &AtomicBool::new(false))?;
+        let output = command(&path).args(["-hide_banner", "-filters"]).output()?;
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("ddagrab"));
+        assert_eq!(
+            path,
+            temp.path().canonicalize()?.join("tools").join("ffmpeg.exe")
+        );
+        Ok(())
+    }
+}

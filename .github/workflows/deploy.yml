@@ -1,0 +1,84 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Build Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install 1.90.0 --profile minimal --component rustfmt,clippy
+
+      - name: Check release tag
+        if: github.ref_type == 'tag'
+        run: |
+          $version = (Get-Content tauri.conf.json -Raw | ConvertFrom-Json).version
+          $manifest = cargo +1.90.0 metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $package = $manifest.packages | Where-Object name -eq 'rewind'
+          if ($package.version -cne $version -or $env:GITHUB_REF_NAME -cne "v$version") {
+            throw 'The Git tag, Cargo version and Tauri version must match.'
+          }
+
+      - name: Check formatting
+        run: cargo +1.90.0 fmt --all -- --check
+
+      - name: Lint
+        run: cargo +1.90.0 clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo +1.90.0 test --locked
+
+      - name: Build Rewind.exe
+        run: |
+          cargo +1.90.0 build --release --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item -LiteralPath target/release/rewind.exe -Destination dist/Rewind.exe
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: Rewind-windows-x64
+          path: dist/Rewind.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: github.ref_type == 'tag'
+    needs: windows
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: Rewind-windows-x64
+          path: dist
+
+      - name: Publish Rewind.exe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release view $tag --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag dist/Rewind.exe --clobber
+          } else {
+            $notes = "[Changelog]($env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/blob/$tag/CHANGELOG.md)"
+            gh release create $tag dist/Rewind.exe --verify-tag --title "Rewind $tag" --notes $notes
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

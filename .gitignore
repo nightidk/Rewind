@@ -1,0 +1,8 @@
+/target/
+/dist/
+/gen/schemas/
+/.idea/
+/.vscode/
+*.log
+*.pdb
+*.part
