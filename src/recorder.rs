@@ -25,6 +25,7 @@ use windows::Win32::System::JobObjects::*;
 use windows::Win32::System::Threading::{BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW};
 
 use crate::audio::Feed;
+use crate::diagnostics;
 use crate::settings::{CaptureMode, Encoder, ExportCodec, Settings};
 
 const SEGMENT: u32 = 2;
@@ -579,6 +580,17 @@ impl Session {
         ]);
         let mut process = Process::start(&mut cmd)
             .context("Не удалось запустить FFmpeg. Проверьте путь в настройках видео")?;
+        diagnostics::record(
+            "capture",
+            format_args!(
+                "FFmpeg started: pid={}, mode={mode:?}, encoder={:?}, target_fps={}, audio_channels={}, executable={}",
+                process.child.id(),
+                plan.encoder,
+                settings.fps,
+                audio.as_ref().map_or(0, |feed| feed.channels),
+                settings.ffmpeg.display()
+            ),
+        );
         let progress = Arc::new(CaptureProgress::default());
         let pipe = process
             .child
@@ -715,17 +727,43 @@ impl Session {
         let mut finished = None;
         if let Some(process) = &mut self.process {
             if let Some(status) = process.child.try_wait()? {
+                let stderr = log_tail(&self.directory.path().join("capture.log"));
+                diagnostics::record(
+                    "capture",
+                    format_args!(
+                        "FFmpeg exited: pid={}, status={status}, stop_requested={}, stderr={stderr}",
+                        process.child.id(),
+                        self.stop_at.is_some()
+                    ),
+                );
                 finished = Some(status.success());
             } else if self
                 .stop_at
                 .is_some_and(|deadline| Instant::now() >= deadline)
             {
+                diagnostics::record(
+                    "capture",
+                    format_args!("FFmpeg did not exit after stop: pid={}", process.child.id()),
+                );
                 self.process.take();
                 finished = Some(true);
             } else if self.stop_at.is_none()
                 && let Some(audio) = &mut self.audio
+                && let Err(error) = audio.check()
             {
-                audio.check()?;
+                let stderr = log_tail(&self.directory.path().join("capture.log"));
+                diagnostics::record(
+                    "audio",
+                    format_args!(
+                        "Audio pipe ended: pid={}, recorded={}s, error={error:#}, ffmpeg stderr={stderr}",
+                        process.child.id(),
+                        self.progress.micros.load(Ordering::Relaxed) / 1_000_000
+                    ),
+                );
+                if self.progress.frames.load(Ordering::Relaxed) == 0 {
+                    return Err(error);
+                }
+                self.audio.take();
             }
         }
         if let Some(success) = finished {
@@ -1007,7 +1045,10 @@ fn next_session(
     while let Some(plan) = plans.pop_front() {
         match Session::start(directory, settings, plan, Arc::clone(microphone_muted)) {
             Ok(session) => return Ok(session),
-            Err(cause) => error = cause,
+            Err(cause) => {
+                diagnostics::record("capture", format_args!("FFmpeg could not start: {cause:#}"));
+                error = cause;
+            }
         }
     }
     Err(error)
@@ -1101,6 +1142,7 @@ impl Recorder {
             Ok(true) => Some(SaveOutcome::Saved),
             Ok(false) => None,
             Err(error) => {
+                diagnostics::record("capture", format_args!("Could not save replay: {error:#}"));
                 self.error = Some(format!("{error:#}"));
                 Some(SaveOutcome::Failed)
             }
@@ -1112,6 +1154,7 @@ impl Recorder {
             let was_recording = session.process.is_some();
             if let Err(mut error) = session.tick(self.export.as_ref().map(|export| &export.pinned))
             {
+                diagnostics::record("capture", format_args!("Recording error: {error:#}"));
                 session.process.take();
                 session.audio.take();
                 let fallback = session.progress.frames.load(Ordering::Relaxed) == 0

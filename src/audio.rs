@@ -28,12 +28,13 @@ use windows::Win32::System::Threading::{
 use windows::core::{GUID, HSTRING, PCWSTR, PWSTR, w};
 
 use crate::applications::{self, ProcessAudio};
-use crate::settings::Settings;
+use crate::{diagnostics, settings::Settings};
 
 const RATE: i64 = 48_000;
 const BLOCK: usize = 480;
 const BUFFER_LEAD: i64 = RATE * 120 / 1000;
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
+const PIPE_STALL: Duration = Duration::from_millis(500);
 type Stereo = [i16; 2];
 
 struct Com;
@@ -102,6 +103,7 @@ struct Input {
 struct Source<T> {
     input: Option<T>,
     retry_at: Instant,
+    unavailable: bool,
 }
 
 impl<T> Source<T> {
@@ -109,6 +111,7 @@ impl<T> Source<T> {
         Self {
             input: None,
             retry_at: now,
+            unavailable: false,
         }
     }
 
@@ -117,16 +120,23 @@ impl<T> Source<T> {
         now: Instant,
         open: impl FnOnce() -> Result<T>,
         read: impl FnOnce(&mut T) -> Result<()>,
-    ) {
-        if self.input.is_none() {
-            if now < self.retry_at {
-                return;
+    ) -> Option<Result<()>> {
+        let result = match self.input.as_mut() {
+            Some(input) => read(input),
+            None if now < self.retry_at => return None,
+            None => open().and_then(|mut input| {
+                read(&mut input)?;
+                self.input = Some(input);
+                Ok(())
+            }),
+        };
+        match result {
+            Ok(()) => std::mem::take(&mut self.unavailable).then_some(Ok(())),
+            Err(error) => {
+                self.input = None;
+                self.retry_at = now + RECONNECT_INTERVAL;
+                (!std::mem::replace(&mut self.unavailable, true)).then_some(Err(error))
             }
-            self.input = open().ok();
-        }
-        if self.input.as_mut().is_none_or(|input| read(input).is_err()) {
-            self.input = None;
-            self.retry_at = now + RECONNECT_INTERVAL;
         }
     }
 }
@@ -138,6 +148,21 @@ struct PacketQueue {
 }
 
 impl PacketQueue {
+    fn discard_before(&mut self, position: i64) {
+        if let Some(first) = self.first
+            && first < position
+        {
+            let discard = (position - first) as usize;
+            if discard >= self.samples.len() {
+                self.samples.clear();
+                self.first = None;
+            } else {
+                self.samples.drain(..discard);
+                self.first = Some(position);
+            }
+        }
+    }
+
     fn push(
         &mut self,
         frames: usize,
@@ -530,21 +555,60 @@ fn run_feed(
     let mut data = vec![0_u8; BLOCK * frame_bytes];
     let mut cursor = 0;
     let mut pending = data.len();
-    let mut deadline = Instant::now();
+    let mut blocked_since: Option<Instant> = None;
+    let mut stalled = false;
+    let mut silence_until = 0;
     while !stop.load(Ordering::Relaxed) {
         let mut now = 0;
         unsafe { QueryPerformanceCounter(&mut now)? };
         let now = (now - origin) * RATE / frequency;
+        if let Some(since) = blocked_since
+            && since.elapsed() >= PIPE_STALL
+        {
+            if !stalled {
+                diagnostics::record(
+                    "audio",
+                    format_args!(
+                        "FFmpeg audio pipe is full at {:.2}s; waiting to send silence",
+                        cursor as f64 / RATE as f64
+                    ),
+                );
+                stalled = true;
+            }
+            let due = (now - BUFFER_LEAD) / BLOCK as i64 * BLOCK as i64;
+            silence_until = silence_until.max(due).max(cursor + BLOCK as i64);
+            // A partially written block must keep its remaining bytes to preserve PCM framing.
+            if pending == 0 {
+                data.fill(0);
+            }
+        }
+        let source_cursor = cursor.max(silence_until);
         if !synthetic {
             let instant = Instant::now();
             for (index, (source, id)) in sources.iter_mut().zip(ids).enumerate() {
                 if let Some(id) = id {
                     // Keep writing PCM for both sources while an endpoint is unavailable.
-                    source.poll(
+                    let change = source.poll(
                         instant,
                         || Input::start(id, index == 0),
-                        |input| input.read(packet_origin, now, cursor),
+                        |input| {
+                            if source_cursor > cursor {
+                                input.queue.discard_before(source_cursor);
+                            }
+                            input.read(packet_origin, now, source_cursor)
+                        },
                     );
+                    let label = ["system audio", "microphone"][index];
+                    match change {
+                        Some(Err(error)) => diagnostics::record(
+                            "audio",
+                            format_args!("{label} unavailable; recording silence: {error:#}"),
+                        ),
+                        Some(Ok(())) => {
+                            diagnostics::record("audio", format_args!("{label} reconnected"))
+                        }
+                        None => {}
+                    }
                 }
             }
             if instant >= next_scan && app_inputs.iter().any(|app| app.process.is_none()) {
@@ -561,7 +625,12 @@ fn run_feed(
                 }
             }
             for app in &mut app_inputs {
-                if app.read(packet_origin, now, cursor).is_err() {
+                if source_cursor > cursor
+                    && let Some(input) = &mut app.input
+                {
+                    input.queue.discard_before(source_cursor);
+                }
+                if app.read(packet_origin, now, source_cursor).is_err() {
                     *app = AppInput::default();
                 }
             }
@@ -571,18 +640,35 @@ fn run_feed(
             unsafe { WriteFile(pipe, Some(&data[pending..]), Some(&mut written), None) }
                 .context("FFmpeg отключился от аудиопотока")?;
             pending += written as usize;
+            if written == 0 {
+                blocked_since.get_or_insert_with(Instant::now);
+                thread::sleep(Duration::from_millis(3));
+                continue;
+            }
+            if let Some(since) = blocked_since.take()
+                && std::mem::take(&mut stalled)
+            {
+                diagnostics::record(
+                    "audio",
+                    format_args!(
+                        "FFmpeg is reading audio again after {:.2}s; filling {:.2}s with silence",
+                        since.elapsed().as_secs_f64(),
+                        (silence_until - cursor) as f64 / RATE as f64
+                    ),
+                );
+            }
             if pending == data.len() {
                 cursor += BLOCK as i64;
-            } else if written == 0 {
-                if Instant::now() >= deadline {
-                    bail!("FFmpeg перестал принимать звук");
-                }
-                thread::sleep(Duration::from_millis(3));
             }
             continue;
         }
         if now < cursor + BLOCK as i64 + BUFFER_LEAD {
             thread::sleep(Duration::from_millis(3));
+            continue;
+        }
+        if cursor < silence_until {
+            data.fill(0);
+            pending = 0;
             continue;
         }
         let mut peak = 0;
@@ -619,7 +705,6 @@ fn run_feed(
         }
         level.fetch_max(peak, Ordering::Relaxed);
         pending = 0;
-        deadline = Instant::now() + Duration::from_secs(3);
     }
     Ok(())
 }
@@ -628,6 +713,35 @@ fn run_feed(
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn full_pipe_preserves_the_pcm_timeline_and_resumes_live_audio() -> Result<()> {
+        let settings = Settings::default();
+        let mut feed = Feed::spawn(&settings, true, "pipe-stall-test", Arc::default())?
+            .context("Missing test feed")?;
+        let mut input = std::fs::File::open(&feed.name)?;
+        let mut block = [0; BLOCK * 8];
+        input.read_exact(&mut block)?;
+        assert!(block.iter().any(|&byte| byte != 0));
+
+        // Fill the pipe and keep it full beyond the old three-second timeout.
+        thread::sleep(Duration::from_millis(5_300));
+        feed.check()?;
+
+        let mut silence = 0;
+        for _ in 0..700 {
+            input.read_exact(&mut block)?;
+            if block.iter().all(|&byte| byte == 0) {
+                silence += 1;
+            } else if silence >= 100 {
+                feed.check()?;
+                return Ok(());
+            }
+        }
+        bail!(
+            "Expected a gap filled with silence followed by live audio, got {silence} silent blocks"
+        )
+    }
 
     #[test]
     fn muting_writes_silent_mic_channels_without_interrupting_the_feed() -> Result<()> {

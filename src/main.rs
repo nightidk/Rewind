@@ -3,6 +3,7 @@
 mod applications;
 mod audio;
 mod control_panel;
+mod diagnostics;
 mod download_progress;
 mod ffmpeg;
 mod localization;
@@ -85,6 +86,7 @@ enum Request {
     InstallUpdate,
     ReadReleaseNotes,
     OpenFolder,
+    OpenLogs,
     OpenClip,
     OpenOverlay,
     OverlayShortcut {
@@ -468,6 +470,14 @@ fn run() -> Result<()> {
         }
         result => result?,
     };
+    let logs = directory.join("logs");
+    let _journal = diagnostics::Journal::start(&logs)
+        .inspect_err(|error| eprintln!("Could not start Rewind log: {error}"))
+        .ok();
+    diagnostics::record(
+        "app",
+        format_args!("Rewind {} started", env!("CARGO_PKG_VERSION")),
+    );
     let (mut settings, load_error) = match Settings::load(&directory).and_then(|settings| {
         settings.validate()?;
         Ok(settings)
@@ -1239,6 +1249,10 @@ fn run() -> Result<()> {
                             fs::create_dir_all(&settings.output)?;
                             launch(settings.output.as_os_str())?;
                         }
+                        Request::OpenLogs => {
+                            fs::create_dir_all(&logs)?;
+                            launch(logs.as_os_str())?;
+                        }
                         Request::OpenClip => launch(
                             recorder
                                 .last
@@ -1356,6 +1370,7 @@ fn run() -> Result<()> {
                 }
             }
             if let Err(error) = result {
+                diagnostics::record("app", format_args!("{error:#}"));
                 let message = if capture_action {
                     let message = recording_error_text(&error);
                     notify(&mut overlay, locale, Notice::RecordingFailed, &message);
@@ -1482,6 +1497,7 @@ fn run() -> Result<()> {
     });
     drop((keep_ticking, window_events));
     EVENT_PUMP.set(None);
+    diagnostics::record("app", format_args!("Rewind stopped"));
     drop(lock);
     Ok(())
 }
