@@ -79,7 +79,14 @@ unsafe extern "system" fn dispatch_message(
     sender: usize,
 ) -> LRESULT {
     let event = if message == WM_HOTKEY {
-        AppEvent::Hotkey
+        if matches!(
+            wp.0 as i32,
+            crate::control_panel::HOTKEY | crate::control_panel::HOTKEY_ALT
+        ) {
+            AppEvent::OverlayHotkey
+        } else {
+            AppEvent::Hotkey
+        }
     } else if message != 0 && message == show_message() {
         AppEvent::Show
     } else {

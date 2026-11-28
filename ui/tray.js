@@ -1,4 +1,5 @@
 import { localize, t } from "./i18n.js";
+import { downloadLabel } from "./ffmpeg-progress.js";
 
 localize("ru");
 
@@ -12,15 +13,14 @@ const text = (selector, value) => {
 };
 
 window.rewind = {
-  status({ phase, seconds, limit, saving, shortcut, locale, toggle_label, toggle_enabled }) {
+  status({ phase, seconds, limit, saving, shortcut, locale, toggle_label, toggle_enabled, download }) {
     localize(locale);
     document.body.dataset.phase = phase;
-    text("#record-state", t({
+    text("#record-state", phase === "downloading" ? downloadLabel(download) : t({
       idle: seconds ? "Запись остановлена" : "Буфер выключен",
       starting: "Запуск записи",
       recording: "Идёт запись",
       stopping: "Завершаем запись",
-      downloading: "Установка FFmpeg",
     }[phase]));
     text("#elapsed", time(seconds));
     text("#limit", "/ " + time(limit));

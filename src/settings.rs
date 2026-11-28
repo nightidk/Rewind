@@ -41,6 +41,7 @@ pub struct Preferences {
     pub interface_scale: u16,
     pub start_with_windows: bool,
     pub auto_update: bool,
+    pub overlay_shortcut: OverlayShortcut,
 }
 
 impl Default for Preferences {
@@ -51,7 +52,36 @@ impl Default for Preferences {
             interface_scale: 100,
             start_with_windows: false,
             auto_update: true,
+            overlay_shortcut: OverlayShortcut::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayShortcut {
+    pub key: u16,
+    pub alt: bool,
+    pub ctrl: bool,
+    pub shift: bool,
+    pub win: bool,
+}
+
+impl Default for OverlayShortcut {
+    fn default() -> Self {
+        Self {
+            key: b'Z'.into(),
+            alt: true,
+            ctrl: false,
+            shift: false,
+            win: false,
+        }
+    }
+}
+
+impl OverlayShortcut {
+    pub fn valid(self) -> bool {
+        (self.alt || self.ctrl || self.shift || self.win)
+            && matches!(self.key, 0x20..=0x28 | 0x2D..=0x2E | 0x30..=0x39 | 0x41..=0x5A | 0x70..=0x87)
     }
 }
 

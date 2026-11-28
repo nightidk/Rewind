@@ -1,6 +1,6 @@
 {
   "productName": "Rewind",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "identifier": "Rewind.Replay",
   "build": { "frontendDist": "ui" },
   "app": {

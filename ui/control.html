@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Оверлей Rewind</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/control.css">
+  <script type="module" src="/control.js"></script>
+</head>
+<body class="control">
+  <main class="hud" aria-label="Оверлей Rewind">
+    <header class="hud-widget hud-brand" data-widget="brand" aria-label="Логотип Rewind">
+      <div class="identity">
+        <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M11 5v14L2 12l9-7Zm10 0v14l-9-7 9-7Z"/></svg></span>
+        <span class="brand">rewind<span>.</span></span>
+      </div>
+    </header>
+    <section class="hud-widget control-transport" data-widget="transport" aria-label="Управление буфером">
+      <button type="button" id="control-toggle" class="pill primary" data-action="toggle_buffer" aria-label="Включить буфер" data-tooltip="Включить буфер" disabled>
+        <svg viewBox="0 0 24 24" aria-hidden="true" data-control-icon="start"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true" data-control-icon="stop" hidden><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true" data-control-icon="cancel" hidden><circle cx="12" cy="12" r="8"/><path d="m9 9 6 6m0-6-6 6"/></svg>
+      </button>
+      <button type="button" id="control-save" class="pill" data-action="save" aria-label="Сохранить повтор" data-tooltip="Сохранить повтор" disabled>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h11l3 3v13H5zM9 4v5h6V4m-7 16v-7h8v7"/></svg>
+      </button>
+      <button type="button" class="pill hud-close" data-action="dismiss" aria-label="Закрыть" data-tooltip="Закрыть">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+      </button>
+    </section>
+    <section class="hud-widget control-readout" data-widget="status" aria-label="Буфер повтора">
+      <div class="control-buffer">
+        <div><strong id="control-elapsed">00:00</strong><span id="control-limit">/ 05:00</span></div>
+        <span class="record-state"><span class="dot" aria-hidden="true"></span><span id="control-state" role="status">Буфер выключен</span></span>
+      </div>
+      <progress id="control-filled" value="0" max="300" aria-label="Заполненность буфера"></progress>
+      <div class="download-progress" id="control-download" hidden>
+        <div class="download-meta"><strong data-download-percent></strong><span data-download-detail></span></div>
+        <progress max="100" aria-label="Загрузка FFmpeg"></progress>
+      </div>
+    </section>
+    <form class="hud-widget quick-settings" id="control-settings" data-widget="settings" aria-labelledby="quick-heading">
+      <h2 id="quick-heading">Быстрые настройки</h2>
+      <fieldset class="fields" id="quick-fields" disabled>
+        <label>Длительность<select name="seconds"><option value="30">00:30</option><option value="60">01:00</option><option value="120">02:00</option><option value="300">05:00</option><option value="600">10:00</option><option value="900">15:00</option><option value="1800">30:00</option></select></label>
+        <label>Частота кадров<select name="fps"><option>24</option><option>25</option><option>30</option><option>50</option><option>60</option><option>90</option><option>120</option><option>144</option></select></label>
+        <label>Кодек клипа<select name="export_codec"><option value="h264">H.264</option><option value="hevc">H.265</option><option value="av1">AV1</option></select></label>
+      </fieldset>
+      <div class="control-footer">
+        <output id="control-feedback" role="status"></output>
+        <button type="submit" class="pill" id="control-apply" disabled>Применить</button>
+      </div>
+    </form>
+    <div class="hud-layout">
+      <button type="button" class="pill" id="hud-pin">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="10" width="14" height="11" rx="2"/><path id="hud-lock-shackle" d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+        <span id="hud-pin-label">Переместить блоки</span>
+      </button>
+    </div>
+  </main>
+  <div id="tooltip" role="tooltip" popover="manual"></div>
+</body>
+</html>

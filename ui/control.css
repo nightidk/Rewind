@@ -1,0 +1,57 @@
+html:has(.control) { background: transparent; overflow: hidden; }
+.control { min-width: 0; }
+.hud { --hud-gap: clamp(14px, 1.65vw, 26px); position: relative; width: 100vw; height: 100vh; overflow: hidden; background: rgb(0 0 0 / 28%); }
+.hud[data-dismissing] { background: transparent; }
+.hud-widget, .hud-layout { position: absolute; }
+.hud-widget { max-width: calc(100% - 2 * var(--hud-gap)); border: 1px solid var(--line); border-radius: 5px; background: var(--surface); box-shadow: 0 6px 20px #0006; }
+.hud-widget[data-positioned] { inset: auto; left: var(--widget-x); top: var(--widget-y); transform: none; }
+.hud[data-editing] .hud-widget { cursor: grab; touch-action: none; outline: 1px dashed var(--green); outline-offset: 3px; }
+.hud[data-editing] .hud-widget:is(:hover, :focus-visible) { outline-style: solid; }
+.hud .hud-widget[data-dragging] { z-index: 2; cursor: grabbing; }
+.hud-brand { top: var(--hud-gap); left: var(--hud-gap); padding: 10px 14px; }
+.hud-brand .identity { gap: 9px; }
+.hud-brand .mark { width: 31px; height: 31px; }
+.hud-brand .mark svg { width: 17px; height: 17px; }
+.hud-brand .brand { font-size: 24px; letter-spacing: -1.1px; }
+.control-transport { top: var(--hud-gap); left: 50%; transform: translateX(-50%); display: flex; flex-wrap: wrap; align-items: center; gap: 8px; width: max-content; padding: 8px; }
+.control-transport .pill { width: 42px; min-height: 38px; padding: 0; }
+.control-transport .pill svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.control-transport .hud-close { margin-inline-start: 3px; }
+.control-transport .hud-close:not(:disabled):hover { background: #281714; border-color: #64352d; color: #ffac9e; }
+.control-readout { top: var(--hud-gap); right: var(--hud-gap); width: min(306px, calc(100% - 2 * var(--hud-gap))); padding: 11px 14px; }
+.control-buffer, .control-footer { display: flex; align-items: center; justify-content: space-between; gap: 9px; }
+.control-buffer > div { display: flex; align-items: baseline; gap: 6px; font-variant-numeric: tabular-nums; }
+#control-elapsed { font-size: 28px; font-weight: 600; line-height: 1.06; letter-spacing: -.04em; }
+#control-limit { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.control .record-state { font-size: 11px; justify-content: end; text-align: end; white-space: normal; line-height: 1.3; }
+.control .dot { width: 6px; height: 6px; }
+.control progress { margin-top: 8px; }
+.control .download-progress { min-height: 0; margin-top: 8px; }
+.control .download-meta strong { font-size: 16px; }
+.control .download-meta span { font-size: 11px; }
+.quick-settings { bottom: var(--hud-gap); right: var(--hud-gap); width: min(280px, calc(100% - 2 * var(--hud-gap))); padding: 14px; }
+#quick-heading { font-size: 15px; margin-bottom: 10px; }
+#quick-fields { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+#quick-fields:disabled { opacity: .58; }
+#quick-fields label { grid-template-columns: minmax(0, 1fr) minmax(72px, 92px); align-items: center; font-size: 12px; }
+#quick-fields select { min-height: 31px; padding: 4px 7px; font-size: 12px; }
+.control-footer { min-height: 32px; margin-top: 10px; }
+#control-feedback { min-width: 0; color: var(--muted); font-size: 11px; line-height: 1.3; }
+#control-feedback[data-error] { color: var(--alert); }
+#control-apply { margin-inline-start: auto; min-height: 30px; padding-inline: 11px; font-size: 12px; }
+.hud-layout { bottom: var(--hud-gap); left: var(--hud-gap); z-index: 3; }
+#hud-pin { border-color: var(--line); background: var(--surface); box-shadow: 0 6px 20px #0006; font-size: 12px; }
+#hud-pin:hover { border-color: var(--green); }
+.hud[data-editing] #hud-pin { border-color: var(--green); background: var(--green); color: #061610; }
+@media (max-width: 860px) {
+  .control-transport { top: calc(var(--hud-gap) + 110px); }
+}
+@media (max-width: 510px) {
+  .control-readout { width: min(250px, calc(100% - 135px - 2 * var(--hud-gap))); }
+  .control-buffer { flex-wrap: wrap; }
+  .hud-brand { padding-inline: 9px; }
+  .hud-brand .brand { font-size: 19px; }
+  .hud-brand .mark { width: 24px; height: 24px; }
+  .control-transport { top: calc(var(--hud-gap) + 136px); }
+  .quick-settings { bottom: calc(var(--hud-gap) + 48px); }
+}

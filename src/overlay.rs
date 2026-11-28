@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::collections::VecDeque;
 use std::mem::size_of;
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,8 @@ pub enum Notice {
     Saved,
     Failed,
     RecordingFailed,
+    BufferStarted,
+    BufferStopped,
 }
 
 impl Notice {
@@ -41,6 +44,8 @@ impl Notice {
             Self::Saved => "Повтор сохранён",
             Self::Failed => "Повтор не сохранён",
             Self::RecordingFailed => "Ошибка записи",
+            Self::BufferStarted => "Буфер включён",
+            Self::BufferStopped => "Буфер остановлен",
         }
     }
 
@@ -61,8 +66,8 @@ pub struct Overlay {
     font: HANDLE,
     content: Box<UnsafeCell<Content>>,
     until: Option<Instant>,
-    saving_until: Option<Instant>,
-    pending: Option<(Notice, Locale, Vec<u16>)>,
+    readable_until: Option<Instant>,
+    pending: VecDeque<(Notice, Locale, Vec<u16>)>,
 }
 
 impl Overlay {
@@ -118,8 +123,8 @@ impl Overlay {
                 dpi: 96,
             })),
             until: None,
-            saving_until: None,
-            pending: None,
+            readable_until: None,
+            pending: VecDeque::new(),
         };
         // The boxed state stays at a stable address on the event loop's window thread.
         unsafe {
@@ -137,8 +142,8 @@ impl Overlay {
             .unwrap_or_default()
             .encode_utf16()
             .collect();
-        if !matches!(notice, Notice::Saving) && self.saving_until.is_some_and(|until| now < until) {
-            self.pending = Some((notice, locale, detail));
+        if !self.pending.is_empty() || self.readable_until.is_some_and(|until| now < until) {
+            self.pending.push_back((notice, locale, detail));
             return Ok(());
         }
         // The primary monitor contains the origin of the Windows virtual desktop.
@@ -175,10 +180,6 @@ impl Overlay {
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             )?;
         }
-        self.pending = None;
-        // Give the start notice time to be read even when an H.264 export finishes immediately.
-        self.saving_until =
-            matches!(notice, Notice::Saving).then_some(now + Duration::from_millis(800));
         self.render(notice, locale, detail, now);
         Ok(())
     }
@@ -193,12 +194,14 @@ impl Overlay {
             let _ = UpdateWindow(self.window);
         }
         self.until = Some(now + Duration::from_secs(4));
+        // A stop and a completed export can arrive on the same tick.
+        self.readable_until = Some(now + Duration::from_millis(800));
     }
 
     pub fn tick(&mut self, now: Instant) {
-        if self.saving_until.is_some_and(|until| now >= until) {
-            self.saving_until = None;
-            if let Some((notice, locale, detail)) = self.pending.take() {
+        if self.readable_until.is_some_and(|until| now >= until) {
+            self.readable_until = None;
+            if let Some((notice, locale, detail)) = self.pending.pop_front() {
                 self.render(notice, locale, detail, now);
             }
         }
@@ -396,12 +399,22 @@ fn overlay_stays_above_the_desktop_without_activating() -> Result<()> {
     unsafe { GetWindowDisplayAffinity(overlay.window, &mut affinity)? };
     assert_eq!(affinity, WDA_NONE.0);
     overlay.show(Notice::Saved, Locale::En, "Replay.mp4")?;
+    overlay.show(
+        Notice::BufferStopped,
+        Locale::En,
+        "The buffered replay is ready to save.",
+    )?;
     assert_eq!(unsafe { GetForegroundWindow() }, foreground);
     assert!(matches!(overlay.content.get_mut().notice, Notice::Saving));
     let settled = Instant::now() + Duration::from_secs(1);
     overlay.tick(settled);
     assert!(matches!(overlay.content.get_mut().notice, Notice::Saved));
-    overlay.tick(settled + Duration::from_secs(5));
+    overlay.tick(settled + Duration::from_secs(1));
+    assert!(matches!(
+        overlay.content.get_mut().notice,
+        Notice::BufferStopped
+    ));
+    overlay.tick(settled + Duration::from_secs(6));
     assert!(!unsafe { IsWindowVisible(overlay.window) }.as_bool());
     Ok(())
 }

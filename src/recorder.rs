@@ -302,8 +302,6 @@ impl Session {
         let mode = match plan.input {
             VideoInput::Synthetic => {
                 cmd.args([
-                    "-thread_queue_size",
-                    "8",
                     "-re",
                     "-f",
                     "lavfi",
@@ -341,8 +339,6 @@ impl Session {
             }
             VideoInput::Gdi(display) => {
                 cmd.args([
-                    "-thread_queue_size",
-                    "8",
                     "-f",
                     "gdigrab",
                     "-framerate",
@@ -370,8 +366,6 @@ impl Session {
                 format!("{}C", feed.channels)
             };
             cmd.args([
-                "-thread_queue_size",
-                "256",
                 "-f",
                 "s16le",
                 "-ar",

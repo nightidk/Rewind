@@ -4,6 +4,8 @@
 
 Instant replay for Windows.
 
+[Download Rewind.exe](https://github.com/nightidk/Rewind/releases/latest/download/Rewind.exe)
+
 ![Rewind replay buffer](docs/screenshots/buffer-en.png)
 
 ## Features
@@ -12,7 +14,7 @@ Instant replay for Windows.
 - DXGI or GDI screen capture with configurable resolution, frame rate, and bitrate. Supports NVIDIA NVENC, AMD AMF, and Intel Quick Sync on compatible hardware.
 - Up to ten audio tracks from system audio, the microphone, or individual apps. Per-app capture is available on Windows 10 version 2004 or later and Windows 11.
 - H.264, H.265, or AV1 export. H.264 clips retain the original video stream.
-- Recording controls in the system tray, save and error notifications, and English and Russian interfaces.
+- Recording controls in the system tray and fullscreen overlay. Notifications for buffer start, stop, saves, and errors.
 
 | Video settings | Audio settings |
 | --- | --- |
@@ -21,7 +23,7 @@ Instant replay for Windows.
 ## Usage
 
 1. Run `Rewind.exe` and select **Start buffer**.
-2. Save a replay with the hotkey set under **Video**. The default is **Alt + F10**. You can also save from the main window or the tray menu.
+2. Save a replay with the hotkey set under **Video**. The default is **Alt + F10**. You can also save from the main window, tray menu, or overlay.
 3. Open the MP4 with **Open** or find it in the **Clips folder**.
 
 Left-click or right-click the tray icon to open the tray menu, where you can start or stop the buffer. Double-click it to open the main window. By default, closing the window asks whether to quit or minimize to the tray. You can change the language, interface scale, and close behavior under **Settings**.
@@ -34,6 +36,16 @@ In **Settings**, you can disable automatic update checks or check manually. Rewi
 
 Rewind stores the buffer in `%LOCALAPPDATA%\Rewind\buffers`. Recording continues while the app is in the tray. Quitting clears the temporary files. After a clip is saved, the buffer starts filling again. Clips go in the `Rewind` subfolder of your Windows Videos folder by default.
 
+## Overlay
+
+Press **Alt + Z** or select **Overlay** in the main window or tray menu. From the overlay you can start or stop the buffer and save a replay. Stop the buffer to change its length, frame rate, or clip codec.
+
+Select **Move widgets**, drag the widgets into place, and select **Lock widgets**. The layout persists after a restart. You can reset the layout or change the shortcut under **Settings**.
+
+![Rewind fullscreen overlay](docs/screenshots/overlay-en.png)
+
+[Widget placement mode](docs/screenshots/overlay-layout-en.png)
+
 ## Build
 
 Requires Windows 10 or 11, Microsoft Edge WebView2 Runtime, Rust 1.90 or later with an MSVC target, and Visual Studio Build Tools with C++ and the Windows SDK. The interface uses Tauri 2. Capture and export use Rust, WASAPI, and FFmpeg.
@@ -42,7 +54,7 @@ Requires Windows 10 or 11, Microsoft Edge WebView2 Runtime, Rust 1.90 or later w
 cargo build --release --locked
 ```
 
-The executable is `target\release\rewind.exe`. Rewind looks for FFmpeg at the configured path, next to the executable, in `PATH`, and in its data folder. If FFmpeg is missing when you start the buffer, you can download it, choose an existing `ffmpeg.exe`, or quit. Rewind verifies the archive checksum after downloading.
+The executable is `target\release\rewind.exe`. Rewind looks for FFmpeg at the configured path, next to the executable, in `PATH`, and in its data folder. The detected path appears under **Video**. If FFmpeg is missing when you start the buffer, you can download it, choose an existing `ffmpeg.exe`, or quit. Rewind shows download progress and verifies the archive checksum before extraction.
 
 ## Checks
 

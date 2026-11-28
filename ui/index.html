@@ -31,7 +31,10 @@
         <button type="button" class="pill tab" data-page="audio">Аудио</button>
         <button type="button" class="pill tab" data-page="settings">Настройки</button>
       </div>
-      <button type="button" class="pill folder" data-action="open_folder"><span data-icon="folder"></span>Папка клипов</button>
+      <div class="nav-actions">
+        <button type="button" class="pill" id="open-overlay" data-action="open_overlay" data-tooltip="Открыть оверлей Rewind"><span data-icon="overlay"></span>Оверлей</button>
+        <button type="button" class="pill folder" data-action="open_folder"><span data-icon="folder"></span>Папка клипов</button>
+      </div>
     </nav>
 
     <div class="notice" id="error" role="alert" hidden><span data-icon="alert"></span><span id="error-text"></span></div>
@@ -54,6 +57,10 @@
               <div class="playhead" aria-hidden="true"></div>
             </div>
             <div class="scale" id="scale" aria-hidden="true"></div>
+            <div class="download-progress" id="ffmpeg-progress" hidden>
+              <div class="download-meta"><strong data-download-percent></strong><span data-download-detail></span></div>
+              <progress max="100" aria-label="Загрузка FFmpeg"></progress>
+            </div>
             <div class="transport">
               <button type="button" id="primary" class="pill primary"><span id="primary-icon" data-icon="play"></span><span id="primary-text">Включить буфер</span></button>
               <button type="button" id="stop" class="pill" data-action="stop" hidden>Остановить</button>
@@ -157,6 +164,20 @@
             <div class="startup-setting wide">
               <label class="switch-label"><input class="switch" type="checkbox" name="start_with_windows" aria-describedby="startup-hint">Запускать с Windows</label>
               <p class="hint" id="startup-hint">При входе в Windows буфер включится снова, если он был активен.</p>
+            </div>
+            <div class="overlay-setting wide">
+              <span id="overlay-shortcut-label">Горячая клавиша оверлея</span>
+              <div class="overlay-shortcut-actions">
+                <button type="button" class="pill" id="overlay-shortcut" aria-describedby="overlay-shortcut-label overlay-shortcut-status">Alt + Z</button>
+                <button type="button" class="pill" id="reset-overlay-shortcut">По умолчанию</button>
+              </div>
+              <output id="overlay-shortcut-status" role="status"></output>
+            </div>
+            <div class="overlay-setting wide">
+              <span>Расстановка оверлея</span>
+              <div class="overlay-shortcut-actions">
+                <button type="button" class="pill" id="reset-overlay-layout">Сбросить расстановку</button>
+              </div>
             </div>
           </div>
           <output id="preferences-feedback" class="preferences-status" role="status"></output>

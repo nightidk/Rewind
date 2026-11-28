@@ -1,11 +1,14 @@
 import { language, localize, t } from "./i18n.js";
 import { setupTooltips } from "./tooltips.js";
+import { downloadLabel, renderDownload } from "./ffmpeg-progress.js";
+import { overlayPositionKey } from "./overlay-layout.js";
 
 const icons = {
   rewind: '<path fill="currentColor" stroke="none" d="M11 5v14L2 12l9-7Zm10 0v14l-9-7 9-7Z"/>',
   play: '<path fill="currentColor" stroke="none" d="m8 4 12 8-12 8V4Z"/>',
   folder: '<path d="M3 6h6l2 2h10v11H3z"/>',
   monitor: '<rect x="3" y="4" width="18" height="13" rx="1"/><path d="M12 17v4m-4 0h8"/>',
+  overlay: '<rect x="3" y="4" width="18" height="16" rx="2"/><rect x="11" y="11" width="7" height="6" rx="1"/>',
   layers: '<path d="m12 3 9 5-9 5-9-5 9-5Zm-9 9 9 5 9-5m-18 4 9 5 9-5"/>',
   chip: '<rect x="5" y="5" width="14" height="14" rx="1"/><path d="M9 2v3m6-3v3M9 19v3m6-3v3M2 9h3m-3 6h3m14-6h3m-3 6h3"/>',
   wave: '<path d="M4 10v4m4-8v12m4-15v18m4-14v10m4-7v4"/>',
@@ -41,11 +44,30 @@ function icon(element, name = element.dataset.icon) {
 all("[data-icon]").forEach((element) => icon(element));
 
 let settings;
+let ffmpegEdited = false;
 let applications = [];
 let update = { state: "idle", version: null };
 let shortcut = true;
 let saving = false;
 let phase = "idle";
+const defaultOverlayShortcut = { key: 90, ctrl: false, alt: true, shift: false, win: false };
+const shortcutKeys = { Space: 32, PageUp: 33, PageDown: 34, End: 35, Home: 36, ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Insert: 45, Delete: 46 };
+let capturingShortcut = false;
+let overlayBinding = { shortcut: defaultOverlayShortcut, registered: false };
+
+function showOverlayShortcut() {
+  const { shortcut, registered, error } = overlayBinding;
+  const { key, ctrl, alt, shift, win } = shortcut;
+  const known = Object.keys(shortcutKeys).find((name) => shortcutKeys[name] === key);
+  const label = key >= 112 ? `F${key - 111}` : known?.replace(/^Arrow/, "") ?? String.fromCharCode(key);
+  const combination = [ctrl && "Ctrl", alt && "Alt", shift && "Shift", win && "Win", label].filter(Boolean).join(" + ");
+  onText("#overlay-shortcut", capturingShortcut ? t("Нажми сочетание…") : combination);
+  onText("#overlay-shortcut-status", capturingShortcut ? t("Нажми Esc для отмены.") : (error ?? (registered ? "" : t("Горячая клавиша оверлея занята или недоступна."))));
+  const open = $("#open-overlay");
+  open.dataset.tooltip = registered ? `${t("Открыть оверлей Rewind")} (${combination})` : "Открыть оверлей Rewind";
+  if (registered && !win) open.setAttribute("aria-keyshortcuts", combination.replaceAll(" ", ""));
+  else open.removeAttribute("aria-keyshortcuts");
+}
 let last = null;
 let limit = 0;
 let page = "buffer";
@@ -197,6 +219,13 @@ function fill(config, displays) {
   resolutionMode();
 }
 
+function displayPath(path) {
+  const extended = "\\\\?\\";
+  if (path.startsWith(extended + "UNC\\")) return "\\\\" + path.slice(8);
+  if (path.startsWith(extended) && /^[a-z]:\\/i.test(path.slice(4))) return path.slice(4);
+  return path;
+}
+
 function mode() {
   const automatic = field("automatic_capture").checked;
   const dxgi = !automatic && field("mode").value === "dxgi";
@@ -343,6 +372,7 @@ function apply() {
     native_resolution: field("native_resolution").checked,
     tracks: trackValues(),
   };
+  if (!ffmpegEdited) next.ffmpeg = settings.ffmpeg;
   applying = true;
   feedback(t("Сохраняем настройки…"));
   refreshControls();
@@ -364,7 +394,7 @@ async function browsePath(kind) {
   const input = field(kind);
   try {
     const path = await pickPath(kind);
-    if (path && !locked() && path !== input.value) {
+    if (path && !locked() && (path !== input.value || kind === "ffmpeg")) {
       input.value = path;
       input.dispatchEvent(new Event("input", { bubbles: true }));
     }
@@ -429,6 +459,7 @@ window.rewind = {
     all(".track").forEach(labelTrack);
     all("[name=track_application]").forEach((select) => listApplications(select));
     refreshUpdate();
+    showOverlayShortcut();
     all("option[data-message]").forEach((option) => { option.textContent = t(option.dataset.message); });
     all("option[data-primary]").forEach((option) => { option.textContent = option.dataset.primary + " · " + t("Основной"); });
     if (settings) {
@@ -473,12 +504,32 @@ window.rewind = {
   },
   ffmpegPath(path) {
     settings.ffmpeg = path;
-    field("ffmpeg").value = path;
+    ffmpegEdited = false;
+    this.detectedFfmpeg(path);
+  },
+  detectedFfmpeg(path) {
+    if (!ffmpegEdited) field("ffmpeg").value = displayPath(path ?? settings?.ffmpeg ?? "");
+  },
+  overlayShortcut(binding) {
+    overlayBinding = binding;
+    capturingShortcut = false;
+    showOverlayShortcut();
+  },
+  quickSettings(quick) {
+    if (!settings) return;
+    for (const [name, value] of Object.entries(quick)) {
+      const control = field(name);
+      if (control.value === String(settings[name])) control.value = value;
+      settings[name] = value;
+    }
+    storage();
   },
   configure(config) {
     settings = config.settings;
     shortcut = config.shortcut;
     fill(settings, config.displays);
+    ffmpegEdited = false;
+    this.detectedFfmpeg(config.detected_ffmpeg);
     storage();
     onText("#function-key", "F" + settings.shortcut);
     onText("#summary-size", settings.native_resolution ? t("Как у экрана") : settings.width + " × " + settings.height);
@@ -531,16 +582,22 @@ window.rewind = {
       const mode = !isIdle && state.capture_mode ? state.capture_mode.toUpperCase() + " · " : "";
       onText("#summary-encoder", encoder ? mode + encoders[encoder] : t("Автовыбор"));
     }
-    onText("#global-state", downloading ? t("Установка FFmpeg") : running ? t("Буфер включён") : t("Буфер выключен"));
+    const installLabel = downloading ? downloadLabel(state.download) : "";
+    onText("#global-state", downloading ? installLabel : running ? t("Буфер включён") : t("Буфер выключен"));
     const recording = t("Идёт запись") + " · " + time(state.recorded ?? 0);
-    onText("#local-state", { idle: state.seconds ? t("Запись остановлена") : t("Ожидает запуска"), recording, starting: t("Запуск записи"), stopping: t("Завершаем запись"), downloading: t("Скачиваем FFmpeg") }[phase]);
+    onText("#local-state", { idle: state.seconds ? t("Запись остановлена") : t("Ожидает запуска"), recording, starting: t("Запуск записи"), stopping: t("Завершаем запись"), downloading: installLabel }[phase]);
     plot(state, state.limit ?? settings?.seconds ?? 300);
+    const progress = $("#ffmpeg-progress");
+    progress.hidden = !downloading;
+    $("#plot").hidden = $("#scale").hidden = downloading;
+    if (downloading) renderDownload(progress, state.download);
     const primary = $("#primary");
     const save = (!isIdle && !downloading) || Boolean(state.seconds);
     primary.dataset.command = save ? "save" : "start";
     primary.disabled = !settings || saving || pendingAction || phase === "stopping" || downloading;
     icon($("#primary-icon"), save ? "rewind" : "play");
-    onText("#primary-text", downloading ? t("Устанавливаем FFmpeg…") : saving ? t("Сохраняем…") : save ? t("Сохранить повтор") : t("Включить буфер"));
+    $("#primary-icon").hidden = downloading;
+    onText("#primary-text", downloading ? installLabel : saving ? t("Сохраняем…") : save ? t("Сохранить повтор") : t("Включить буфер"));
     $("#stop").hidden = isIdle && !state.seconds;
     $("#stop").disabled = phase === "stopping" || (isIdle && saving);
     $("#stop").dataset.action = isIdle ? "start" : "stop";
@@ -595,6 +652,7 @@ document.addEventListener("click", (event) => {
   }
 });
 document.addEventListener("input", (event) => {
+  if (event.target === field("ffmpeg")) ffmpegEdited = true;
   const row = event.target.closest(".track");
   if (row) updateTrackSources(row);
   if (event.target.closest(".editable")) edit(event);
@@ -608,6 +666,42 @@ document.querySelector('.tab[data-page="audio"]').addEventListener("click", () =
 field("mode").addEventListener("change", mode);
 field("automatic_capture").addEventListener("change", mode);
 field("native_resolution").addEventListener("change", resolutionMode);
+const overlayShortcutButton = $("#overlay-shortcut");
+function captureOverlayShortcut(enabled) {
+  capturingShortcut = enabled;
+  showOverlayShortcut();
+  ipc("capture_overlay_shortcut", { enabled });
+}
+overlayShortcutButton.addEventListener("click", () => captureOverlayShortcut(!capturingShortcut));
+overlayShortcutButton.addEventListener("blur", () => {
+  if (capturingShortcut) captureOverlayShortcut(false);
+});
+overlayShortcutButton.addEventListener("keydown", (event) => {
+  if (!capturingShortcut || event.key === "Tab") return;
+  event.preventDefault();
+  if (event.key === "Escape") {
+    captureOverlayShortcut(false);
+    return;
+  }
+  const { code, altKey: alt, ctrlKey: ctrl, shiftKey: shift, metaKey: win } = event;
+  let key = shortcutKeys[code];
+  if (/^Key[A-Z]$/.test(code)) key = code.charCodeAt(3);
+  if (/^Digit[0-9]$/.test(code)) key = code.charCodeAt(5);
+  if (/^F(?:[1-9]|1[0-9]|2[0-4])$/.test(code)) key = 111 + Number(code.slice(1));
+  if (event.repeat || !key || !(alt || ctrl || shift || win)) return;
+  capturingShortcut = false;
+  ipc("overlay_shortcut", { shortcut: { key, alt, ctrl, shift, win } });
+});
+$("#reset-overlay-shortcut").addEventListener("click", () => ipc("overlay_shortcut", { shortcut: defaultOverlayShortcut }));
+$("#reset-overlay-layout").addEventListener("click", () => {
+  try {
+    localStorage.removeItem(overlayPositionKey);
+    onText("#preferences-feedback", t("Расстановка оверлея сброшена."));
+  } catch (error) {
+    console.error(error);
+    onText("#preferences-feedback", t("Не удалось сбросить расстановку оверлея."));
+  }
+});
 for (const name of [...preferenceNames, "start_with_windows", "auto_update"]) {
   field(name).addEventListener("change", () => {
     onText("#preferences-feedback", t("Сохраняем настройки…"));

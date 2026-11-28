@@ -1,6 +1,6 @@
 use std::cell::Cell;
 
-use crate::{ipc, localization::Locale, recorder::Status};
+use crate::{ffmpeg::Progress, ipc, localization::Locale, recorder::Status};
 use anyhow::{Result, ensure};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -42,6 +42,7 @@ struct PanelStatus {
     shortcut: Option<u32>,
     toggle_label: &'static str,
     toggle_enabled: bool,
+    download: Option<Progress>,
 }
 
 pub fn buffer_control(phase: &str, saving: bool) -> (&'static str, bool) {
@@ -189,6 +190,7 @@ impl TrayPanel {
         limit: u32,
         shortcut: Option<u32>,
         locale: Locale,
+        download: Option<Progress>,
     ) {
         if !self.view.is_visible().unwrap_or(false) {
             return;
@@ -203,6 +205,7 @@ impl TrayPanel {
             shortcut,
             toggle_label,
             toggle_enabled,
+            download,
         };
         if self.last.as_ref() != Some(&state) {
             ipc(&self.view, "status", &state);
