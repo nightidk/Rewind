@@ -191,7 +191,18 @@ $backup = [IO.Path]::Combine($folder, 'previous.exe')
 try {
     $running = Get-Process -Id ([int]$env:REWIND_UPDATE_PID) -ErrorAction SilentlyContinue
     if ($running -and -not $running.WaitForExit(30000)) { throw 'Rewind is still running.' }
-    if ((Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash -ne $env:REWIND_UPDATE_DIGEST) {
+    $stream = [IO.File]::OpenRead($staged)
+    try {
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $digest = [BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '')
+        } finally {
+            $sha256.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+    if ($digest -ne $env:REWIND_UPDATE_DIGEST) {
         throw 'Update checksum mismatch.'
     }
     [IO.File]::Replace($staged, $exe, $backup)
