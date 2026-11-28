@@ -1,5 +1,4 @@
 use std::mem::size_of;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -15,6 +14,10 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, HWND_TOPMOST, IsWindowVisible, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+    SetForegroundWindow, SetWindowPos, ShowWindow,
 };
 
 pub const LABEL: &str = "control";
@@ -71,9 +74,9 @@ struct State {
 
 pub struct ControlPanel {
     view: WebviewWindow,
+    hwnd: HWND,
     last: Option<State>,
-    close_serial: u32,
-    closing: Option<(u32, Instant)>,
+    previous_window: HWND,
 }
 
 impl ControlPanel {
@@ -108,46 +111,51 @@ impl ControlPanel {
         };
         Ok(Self {
             view,
+            hwnd,
             last: None,
-            close_serial: 0,
-            closing: None,
+            previous_window: HWND::default(),
         })
     }
 
     pub fn toggle(&mut self) -> Result<()> {
-        if self.view.is_visible()? {
+        if unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
             self.hide();
         } else {
             let monitor = self
                 .view
                 .primary_monitor()?
                 .context("Не удалось определить основной экран.")?;
-            self.view.set_position(*monitor.position())?;
-            self.view.set_size(*monitor.size())?;
             self.refresh();
             ipc(&self.view, "opened", &true);
-            self.view.show()?;
-            let _ = self.view.set_focus();
+            self.previous_window = unsafe { GetForegroundWindow() };
+            unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOPMOST),
+                    monitor.position().x,
+                    monitor.position().y,
+                    i32::try_from(monitor.size().width)?,
+                    i32::try_from(monitor.size().height)?,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                )?;
+                let _ = SetForegroundWindow(self.hwnd);
+            }
         }
         Ok(())
     }
 
     pub fn hide(&mut self) {
-        if self.closing.is_some() || !self.view.is_visible().unwrap_or(false) {
-            return;
-        }
-        self.close_serial = self.close_serial.wrapping_add(1);
-        self.closing = Some((
-            self.close_serial,
-            Instant::now() + Duration::from_millis(300),
-        ));
-        ipc(&self.view, "dismiss", &self.close_serial);
-    }
-
-    pub fn finish_hide(&mut self, close_id: u32) {
-        if self.closing.is_some_and(|(id, _)| id == close_id) {
-            self.closing = None;
-            let _ = self.view.hide();
+        let previous = std::mem::take(&mut self.previous_window);
+        unsafe {
+            if !IsWindowVisible(self.hwnd).as_bool() {
+                return;
+            }
+            // Hide the whole native surface even when the WebView is waiting to paint.
+            let restore_focus = GetForegroundWindow() == self.hwnd;
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+            if restore_focus && previous != self.hwnd && IsWindowVisible(previous).as_bool() {
+                let _ = SetForegroundWindow(previous);
+            }
         }
     }
 
@@ -166,12 +174,7 @@ impl ControlPanel {
         locale: Locale,
         download: Option<Progress>,
     ) {
-        if let Some((id, deadline)) = self.closing
-            && Instant::now() >= deadline
-        {
-            self.finish_hide(id);
-        }
-        if !self.view.is_visible().unwrap_or(false) {
+        if !unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
             return;
         }
         let (toggle_label, toggle_enabled) = buffer_control(status.phase, status.saving);

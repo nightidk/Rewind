@@ -3,6 +3,7 @@
 mod applications;
 mod audio;
 mod control_panel;
+mod download_progress;
 mod ffmpeg;
 mod localization;
 mod overlay;
@@ -113,6 +114,7 @@ enum AppEvent {
     Hotkey,
     Devices(Result<[Vec<audio::Device>; 2]>),
     UpdateChecked(Result<Option<updater::Update>>),
+    UpdateProgress(updater::Progress),
     UpdateDownloaded(Result<updater::Download>),
     FfmpegInstalled(Result<PathBuf>),
     FfmpegProgress(ffmpeg::Progress),
@@ -124,7 +126,6 @@ enum AppEvent {
     OverlayHotkey,
     ControlReady,
     DismissControl,
-    ControlDimmingCleared(u32),
     QuickSettings(QuickSettings),
     Show,
     Quit,
@@ -142,7 +143,6 @@ struct UiStatus<'a> {
 enum ControlAction {
     Ready,
     Dismiss,
-    DimmingCleared { close_id: u32 },
     ToggleBuffer,
     Save,
     Apply { settings: QuickSettings },
@@ -202,7 +202,6 @@ fn control_action(
     let event = match request {
         ControlAction::Ready => AppEvent::ControlReady,
         ControlAction::Dismiss => AppEvent::DismissControl,
-        ControlAction::DimmingCleared { close_id } => AppEvent::ControlDimmingCleared(close_id),
         ControlAction::ToggleBuffer => AppEvent::ToggleBuffer,
         ControlAction::Save => AppEvent::Request(Request::Save),
         ControlAction::Apply { settings } => AppEvent::QuickSettings(settings),
@@ -637,6 +636,7 @@ fn run() -> Result<()> {
     let mut previous_phase = "idle";
     let mut capturing_overlay_shortcut = false;
     let mut update_status = "idle";
+    let mut update_progress = None;
     let mut available_update: Option<updater::Update> = None;
     let mut staged_update: Option<updater::Download> = None;
     let mut next_update_check = Instant::now();
@@ -678,7 +678,7 @@ fn run() -> Result<()> {
             }
             let due = matches!(event, AppEvent::Tick);
             let new_frontend = matches!(event, AppEvent::Request(Request::Ready));
-            let update_before = update_status;
+            let update_before = (update_status, update_progress);
             let capture_action = matches!(
                 &event,
                 AppEvent::Request(Request::Start | Request::Stop | Request::FfmpegChoice { choice: FfmpegChoice::Download | FfmpegChoice::Path { .. } })
@@ -731,10 +731,6 @@ fn run() -> Result<()> {
                 }
                 AppEvent::DismissControl => {
                     if let Some(panel) = &mut control { panel.hide(); }
-                    Ok(())
-                }
-                AppEvent::ControlDimmingCleared(close_id) => {
-                    if let Some(panel) = &mut control { panel.finish_hide(close_id); }
                     Ok(())
                 }
                 AppEvent::QuickSettings(quick) => {
@@ -813,6 +809,7 @@ fn run() -> Result<()> {
                     Ok(())
                 }
                 AppEvent::UpdateDownloaded(result) => {
+                    update_progress = None;
                     update_status = match result {
                         Ok(update) => {
                             staged_update = Some(update);
@@ -820,6 +817,10 @@ fn run() -> Result<()> {
                         }
                         Err(_) => "download_error",
                     };
+                    Ok(())
+                }
+                AppEvent::UpdateProgress(progress) => {
+                    update_progress = Some(progress);
                     Ok(())
                 }
                 AppEvent::FfmpegProgress(progress) => {
@@ -990,10 +991,14 @@ fn run() -> Result<()> {
                                 && let Some(update) = &available_update
                             {
                                 update_status = "downloading";
+                                update_progress = Some(updater::Progress::Connecting);
                                 let update = update.clone();
                                 let proxy = proxy.clone();
                                 std::thread::spawn(move || {
-                                    let _ = proxy.send(AppEvent::UpdateDownloaded(updater::download(&update)));
+                                    let result = updater::download(&update, |progress| {
+                                        let _ = proxy.send(AppEvent::UpdateProgress(progress));
+                                    });
+                                    let _ = proxy.send(AppEvent::UpdateDownloaded(result));
                                 });
                             }
                         }
@@ -1107,10 +1112,11 @@ fn run() -> Result<()> {
             status.error = local_error.as_deref();
             if ready {
                 ipc(&view, "status", &UiStatus { capture: &status, download: ffmpeg_progress });
-                if new_frontend || update_status != update_before {
+                if new_frontend || (update_status, update_progress) != update_before {
                     ipc(&view, "updateState", &json!({
                         "state": update_status,
                         "version": available_update.as_ref().map(|update| &update.version),
+                        "progress": update_progress,
                     }));
                 }
             }

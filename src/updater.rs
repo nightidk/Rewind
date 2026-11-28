@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use semver::Version;
@@ -9,24 +10,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+use crate::download_progress::{ProgressMeter, Transfer};
 use crate::ffmpeg::system_directory;
-use crate::recorder::command;
+use crate::recorder::{Process, command};
 
-const REPOSITORY: &str = "nightidk/Rewind";
-const MAX_RELEASE_METADATA_BYTES: u64 = 1024 * 1024;
+const RELEASES: &str = "https://github.com/nightidk/Rewind/releases";
+const UPDATE_MANIFEST: &str = "manifest.json";
+const MAX_MANIFEST: usize = 4096;
 const MAX_EXE: u64 = 128 * 1024 * 1024;
 
 #[derive(Deserialize)]
-struct Release {
-    tag_name: String,
-    assets: Vec<Asset>,
-}
-
-#[derive(Deserialize)]
-struct Asset {
-    name: String,
+struct Manifest {
     size: u64,
-    digest: Option<String>,
+    sha256: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -43,7 +39,18 @@ pub struct Download {
     digest: String,
 }
 
-fn curl(url: &str) -> Result<Command> {
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub enum Progress {
+    Connecting,
+    Downloading {
+        #[serde(flatten)]
+        transfer: Transfer,
+    },
+    Checking,
+}
+
+fn curl(url: &str, timeout: &str) -> Result<Command> {
     let mut cmd = command(&system_directory()?.join("curl.exe"));
     cmd.args([
         "--disable",
@@ -58,7 +65,7 @@ fn curl(url: &str) -> Result<Command> {
         "--connect-timeout",
         "10",
         "--max-time",
-        "120",
+        timeout,
         "--max-redirs",
         "5",
         "--user-agent",
@@ -69,73 +76,115 @@ fn curl(url: &str) -> Result<Command> {
 }
 
 pub fn check() -> Result<Option<Update>> {
-    let url = format!("https://api.github.com/repos/{REPOSITORY}/releases/latest");
-    let output = curl(&url)?
-        .arg("--max-filesize")
-        .arg(MAX_RELEASE_METADATA_BYTES.to_string())
+    let output = curl(&format!("{RELEASES}/latest"), "30")?
+        .args([
+            "--head",
+            "--output",
+            "NUL",
+            "--write-out",
+            "%{url_effective}",
+        ])
         .output()?;
     ensure!(
         output.status.success(),
         "GitHub Releases: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let release: Release = serde_json::from_slice(&output.stdout)?;
-    prepare(release, &Version::parse(env!("CARGO_PKG_VERSION"))?)
+    let Some(version) = newer_release(
+        std::str::from_utf8(&output.stdout)?,
+        &Version::parse(env!("CARGO_PKG_VERSION"))?,
+    )?
+    else {
+        return Ok(None);
+    };
+    let output = curl(&asset_url(&version, UPDATE_MANIFEST), "30")?
+        .arg("--max-filesize")
+        .arg(MAX_MANIFEST.to_string())
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "Could not download {UPDATE_MANIFEST}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_manifest(version, &output.stdout).map(Some)
 }
 
-fn prepare(release: Release, current: &Version) -> Result<Option<Update>> {
-    let version = Version::parse(
-        release
-            .tag_name
-            .strip_prefix('v')
-            .context("Invalid release tag")?,
-    )?;
+fn newer_release(url: &str, current: &Version) -> Result<Option<Version>> {
+    let version = url
+        .trim()
+        .strip_prefix(RELEASES)
+        .and_then(|path| path.strip_prefix("/tag/v"))
+        .context("Unexpected GitHub release URL")?;
+    let version = Version::parse(version).context("Invalid release tag")?;
     if !version.pre.is_empty() || !version.build.is_empty() || &version <= current {
         return Ok(None);
     }
-    let asset = release
-        .assets
-        .into_iter()
-        .find(|asset| asset.name == "Rewind.exe")
-        .context("Rewind.exe is missing from the release")?;
-    let digest = asset
-        .digest
-        .as_deref()
-        .and_then(|digest| digest.strip_prefix("sha256:"))
-        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .context("GitHub did not provide a SHA-256 digest")?;
-    ensure!(
-        (1..=MAX_EXE).contains(&asset.size),
-        "Invalid Rewind.exe size"
-    );
-    Ok(Some(Update {
-        version: version.to_string(),
-        digest: digest.to_ascii_lowercase(),
-        size: asset.size,
-    }))
+    Ok(Some(version))
 }
 
-pub fn download(update: &Update) -> Result<Download> {
+fn asset_url(version: impl std::fmt::Display, asset: &str) -> String {
+    format!("{RELEASES}/download/v{version}/{asset}")
+}
+
+fn parse_manifest(version: Version, bytes: &[u8]) -> Result<Update> {
+    ensure!(bytes.len() <= MAX_MANIFEST, "Update manifest is too large");
+    let manifest: Manifest = serde_json::from_slice(bytes).context("Invalid update manifest")?;
+    ensure!(
+        manifest.sha256.len() == 64 && manifest.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Invalid Rewind.exe SHA-256"
+    );
+    ensure!(
+        (1..=MAX_EXE).contains(&manifest.size),
+        "Invalid Rewind.exe size"
+    );
+    Ok(Update {
+        version: version.to_string(),
+        digest: manifest.sha256.to_ascii_lowercase(),
+        size: manifest.size,
+    })
+}
+
+pub fn download(update: &Update, mut report: impl FnMut(Progress)) -> Result<Download> {
     let exe = std::env::current_exe()?;
     let folder = tempfile::Builder::new()
         .prefix(".rewind-update-")
         .tempdir_in(exe.parent().context("Missing application directory")?)?;
     let path = folder.path().join("Rewind.exe");
-    let url = format!(
-        "https://github.com/{REPOSITORY}/releases/download/v{}/Rewind.exe",
-        update.version
-    );
-    let output = curl(&url)?
-        .arg("--max-filesize")
-        .arg(update.size.to_string())
-        .arg("--output")
-        .arg(&path)
-        .output()?;
+    let url = asset_url(&update.version, "Rewind.exe");
+    let log = folder.path().join("download.log");
+    let mut transfer = ProgressMeter::new(update.size);
+    let mut process = Process::start(
+        curl(&url, "300")?
+            .args([
+                "--speed-limit",
+                "1024",
+                "--speed-time",
+                "25",
+                "--max-filesize",
+            ])
+            .arg(update.size.to_string())
+            .arg("--output")
+            .arg(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(File::create(&log)?),
+    )?;
+    let status = loop {
+        if let Some(transfer) = transfer.sample(&path) {
+            report(Progress::Downloading { transfer });
+        }
+        if let Some(status) = process.child.try_wait()? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
     ensure!(
-        output.status.success(),
+        status.success(),
         "{}",
-        String::from_utf8_lossy(&output.stderr)
+        fs::read_to_string(&log).unwrap_or_default().trim()
     );
+    fs::remove_file(log)?;
+    report(Progress::Checking);
     verify(&path, update.size, &update.digest)?;
     Ok(Download {
         folder,
@@ -232,26 +281,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn update_requires_a_newer_stable_version_and_a_digest() -> Result<()> {
+    fn latest_release_requires_a_newer_stable_tag_from_the_rewind_repo() -> Result<()> {
         let current = Version::new(0, 9, 0);
-        let release = |tag: &str, digest: Option<String>| Release {
-            tag_name: tag.into(),
-            assets: vec![Asset {
-                name: "Rewind.exe".into(),
-                size: 42,
-                digest,
-            }],
-        };
-        let digest = format!("sha256:{}", "a".repeat(64));
-        assert!(prepare(release("v0.8.0", None), &current)?.is_none());
-        assert!(prepare(release("v1.0.0-beta.1", None), &current)?.is_none());
-        assert!(prepare(release("v0.10.0", None), &current).is_err());
+        for tag in ["v0.8.0", "v0.9.0", "v1.0.0-beta.1", "v1.0.0+build"] {
+            assert!(newer_release(&format!("{RELEASES}/tag/{tag}"), &current)?.is_none());
+        }
         assert_eq!(
-            prepare(release("v0.10.0", Some(digest)), &current)?
-                .unwrap()
-                .version,
-            "0.10.0"
+            newer_release(&format!("{RELEASES}/tag/v0.10.0"), &current)?,
+            Some(Version::new(0, 10, 0))
         );
+        for url in [
+            format!("{RELEASES}/latest"),
+            format!("{RELEASES}/tag/v0.10.0/extra"),
+            "https://github.com/another/Rewind/releases/tag/v0.10.0".into(),
+        ] {
+            assert!(newer_release(&url, &current).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_requires_a_valid_size_and_sha256() -> Result<()> {
+        let version = Version::new(0, 10, 0);
+        let digest = "AB".repeat(32);
+        let json = |size, digest: &str| serde_json::json!({ "size": size, "sha256": digest });
+        let update = parse_manifest(version.clone(), &serde_json::to_vec(&json(42, &digest))?)?;
+        assert_eq!(update.size, 42);
+        assert_eq!(update.digest, digest.to_ascii_lowercase());
+        assert_eq!(
+            asset_url(&update.version, UPDATE_MANIFEST),
+            format!("{RELEASES}/download/v0.10.0/manifest.json")
+        );
+        for invalid in [
+            json(0, &digest),
+            json(MAX_EXE + 1, &digest),
+            json(42, &"g".repeat(64)),
+        ] {
+            assert!(parse_manifest(version.clone(), &serde_json::to_vec(&invalid)?).is_err());
+        }
+        assert!(parse_manifest(version, &vec![b' '; MAX_MANIFEST + 1]).is_err());
         Ok(())
     }
 }

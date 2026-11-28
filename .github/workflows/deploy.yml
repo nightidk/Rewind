@@ -74,11 +74,17 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           $tag = $env:GITHUB_REF_NAME
+          $exe = Get-Item -LiteralPath dist/Rewind.exe
+          $manifest = @{
+            size = $exe.Length
+            sha256 = (Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          } | ConvertTo-Json -Compress
+          Set-Content -LiteralPath dist/manifest.json -Value $manifest -Encoding ascii
           gh release view $tag --json tagName 2>$null | Out-Null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag dist/Rewind.exe --clobber
+            gh release upload $tag dist/Rewind.exe dist/manifest.json --clobber
           } else {
             $notes = "[Changelog]($env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/blob/$tag/CHANGELOG.md)"
-            gh release create $tag dist/Rewind.exe --verify-tag --title "Rewind $tag" --notes $notes
+            gh release create $tag dist/Rewind.exe dist/manifest.json --verify-tag --title "Rewind $tag" --notes $notes
           }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

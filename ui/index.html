@@ -182,7 +182,7 @@
           </div>
           <output id="preferences-feedback" class="preferences-status" role="status"></output>
         </div>
-        <section class="panel controls update-setting" aria-labelledby="updates-heading">
+        <section class="panel controls update-setting" id="updates" aria-labelledby="updates-heading">
           <div class="update-summary">
             <div class="update-heading"><h2 id="updates-heading">Обновления</h2><span id="app-version"></span></div>
             <output id="update-status" class="hint" role="status" hidden></output>
@@ -191,6 +191,10 @@
             <button type="button" class="pill" id="check-update" data-action="check_update">Проверить обновления</button>
             <button type="button" class="pill primary" id="show-update" hidden>Скачать…</button>
             <button type="button" class="pill primary" id="install-update" data-action="install_update" hidden>Установить и перезапустить</button>
+          </div>
+          <div class="download-progress" id="update-progress" hidden>
+            <div class="download-meta"><strong data-download-percent hidden></strong><span data-download-detail></span></div>
+            <progress max="100" aria-label="Загрузка обновления"></progress>
           </div>
           <div class="update-footer">
             <label><input class="switch" type="checkbox" name="auto_update" checked>Автоматически проверять обновления</label>

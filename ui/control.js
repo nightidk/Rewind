@@ -157,15 +157,7 @@ window.addEventListener("storage", (event) => {
 
 window.rewind = {
   opened() {
-    hud.removeAttribute("data-dismissing");
     restorePositions();
-  },
-  dismiss(closeId) {
-    hud.dataset.dismissing = "";
-    restorePositions();
-    requestAnimationFrame(() => requestAnimationFrame(() => {
-      send("dimming_cleared", { close_id: closeId }).catch(console.error);
-    }));
   },
   status({ locale, phase, seconds, limit, saving, toggle_label, toggle_enabled, settings, download }) {
     localize(locale);

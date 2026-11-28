@@ -1,7 +1,6 @@
 html:has(.control) { background: transparent; overflow: hidden; }
 .control { min-width: 0; }
 .hud { --hud-gap: clamp(14px, 1.65vw, 26px); position: relative; width: 100vw; height: 100vh; overflow: hidden; background: rgb(0 0 0 / 28%); }
-.hud[data-dismissing] { background: transparent; }
 .hud-widget, .hud-layout { position: absolute; }
 .hud-widget { max-width: calc(100% - 2 * var(--hud-gap)); border: 1px solid var(--line); border-radius: 5px; background: var(--surface); box-shadow: 0 6px 20px #0006; }
 .hud-widget[data-positioned] { inset: auto; left: var(--widget-x); top: var(--widget-y); transform: none; }

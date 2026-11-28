@@ -287,13 +287,15 @@ function showUpdate() {
 }
 
 function refreshUpdate() {
-  const { state, version } = update;
+  const { state, version, progress } = update;
   const downloadReady = state === "available" || state === "download_error";
+  const downloading = state === "downloading";
+  const downloadStage = { connecting: "Подключаемся к GitHub…", checking: "Проверяем файл обновления…" }[progress?.stage];
   const message = {
     checking: "Проверяем обновления…",
     current: "У вас последняя версия.",
     available: "Новая версия Rewind",
-    downloading: "Скачиваем обновление…",
+    downloading: downloadStage ?? "Скачиваем обновление…",
     downloaded: "Обновление загружено. Перед установкой сохраните нужный повтор и остановите запись.",
     check_error: "Не удалось проверить обновления.",
     download_error: "Не удалось загрузить или установить обновление.",
@@ -304,6 +306,9 @@ function refreshUpdate() {
   $("#show-update").hidden = !downloadReady;
   $("#install-update").hidden = state !== "downloaded";
   onText("#update-version", version ? "v" + version : "");
+  const meter = $("#update-progress");
+  meter.hidden = !downloading;
+  if (downloading) renderDownload(meter, progress);
 }
 
 function edit(event) {
@@ -660,7 +665,11 @@ document.addEventListener("input", (event) => {
 $("#update-prompt").addEventListener("submit", (event) => {
   event.preventDefault();
   $("#update-prompt").close();
-  if (event.submitter?.value === "download") ipc("download_update");
+  if (event.submitter?.value === "download") {
+    goto("settings");
+    $("#updates").scrollIntoView({ block: "nearest" });
+    ipc("download_update");
+  }
 });
 document.querySelector('.tab[data-page="audio"]').addEventListener("click", () => ipc("refresh_applications"));
 field("mode").addEventListener("change", mode);

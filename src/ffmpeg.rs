@@ -5,13 +5,14 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 
+use crate::download_progress::{ProgressMeter, Transfer};
 use crate::recorder::{Process, command};
 
 const URLS: [&str; 2] = [
@@ -29,9 +30,8 @@ pub enum Progress {
         mirror: bool,
     },
     Downloading {
-        bytes: u64,
-        total: u64,
-        remaining: Option<u64>,
+        #[serde(flatten)]
+        transfer: Transfer,
     },
     Checking,
     Extracting,
@@ -88,14 +88,10 @@ fn download(
     for (attempt, url) in URLS.into_iter().enumerate() {
         ensure!(!stop.load(Ordering::Relaxed), "Установка FFmpeg отменена.");
         File::create(archive)?;
-        let started = Instant::now();
-        let mut last_advance = started;
-        let mut next_report = started;
-        let mut bytes = 0;
-        let mut previous = Progress::Connecting {
+        let mut progress = ProgressMeter::new(ARCHIVE_SIZE);
+        report(Progress::Connecting {
             mirror: attempt != 0,
-        };
-        report(previous);
+        });
         let result = run(
             command(curl)
                 .args([
@@ -127,35 +123,8 @@ fn download(
                 .stdin(Stdio::null()),
             stop,
             || {
-                let now = Instant::now();
-                if now < next_report {
-                    return;
-                }
-                next_report = now + Duration::from_millis(350);
-                let received = File::open(archive)
-                    .and_then(|file| file.metadata())
-                    .map_or(bytes, |metadata| metadata.len().min(ARCHIVE_SIZE));
-                if received > bytes {
-                    bytes = received;
-                    last_advance = now;
-                }
-                if bytes == 0 {
-                    return;
-                }
-                let remaining =
-                    (now.duration_since(last_advance) < Duration::from_secs(5)).then(|| {
-                        ((ARCHIVE_SIZE - bytes) as f64 * now.duration_since(started).as_secs_f64()
-                            / bytes as f64)
-                            .ceil() as u64
-                    });
-                let progress = Progress::Downloading {
-                    bytes,
-                    total: ARCHIVE_SIZE,
-                    remaining,
-                };
-                if progress != previous {
-                    previous = progress;
-                    report(progress);
+                if let Some(transfer) = progress.sample(archive) {
+                    report(Progress::Downloading { transfer });
                 }
             },
         );
@@ -237,11 +206,9 @@ mod tests {
             &AtomicBool::new(false),
             |state| progress.push(state),
         )?;
-        assert!(
-            progress
-                .iter()
-                .any(|state| matches!(state, Progress::Downloading { bytes, .. } if *bytes > 0))
-        );
+        assert!(progress.iter().any(
+            |state| matches!(state, Progress::Downloading { transfer } if transfer.bytes > 0)
+        ));
         assert!(progress.ends_with(&[Progress::Checking, Progress::Extracting]));
         let output = command(&path).args(["-hide_banner", "-filters"]).output()?;
         assert!(output.status.success());

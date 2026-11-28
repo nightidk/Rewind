@@ -201,6 +201,9 @@ input:not([type="checkbox"])[aria-invalid="true"] { border-color: var(--alert); 
 .update-heading h2 { margin: 0; }
 .update-heading #app-version { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .update-setting #update-status { display: block; margin-top: 5px; }
+#update-progress { grid-column: 1 / -1; }
+#update-progress .download-meta { margin-bottom: 8px; }
+#update-progress .download-meta strong { font-size: 21px; }
 .update-actions { justify-content: flex-end; align-items: center; }
 .update-footer { grid-column: 1 / -1; justify-content: space-between; flex-wrap: wrap; padding-top: 13px; border-top: 1px solid var(--line); }
 .update-footer label { color: var(--muted); font-size: 13px; }
