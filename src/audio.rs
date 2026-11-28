@@ -23,15 +23,17 @@ use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_NOWAIT, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
 };
 use windows::Win32::System::Threading::{
-    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW,
+    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW,
 };
-use windows::core::{HSTRING, PWSTR, w};
+use windows::core::{GUID, HSTRING, PCWSTR, PWSTR, w};
 
+use crate::applications::{self, ProcessAudio};
 use crate::settings::Settings;
 
 const RATE: i64 = 48_000;
 const BLOCK: usize = 480;
 const BUFFER_LEAD: i64 = RATE * 120 / 1000;
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 type Stereo = [i16; 2];
 
 struct Com;
@@ -91,9 +93,42 @@ pub fn devices() -> Result<[Vec<Device>; 2]> {
 }
 
 struct Input {
-    client: IAudioClient,
     capture: IAudioCaptureClient,
+    client: IAudioClient,
     queue: PacketQueue,
+    _event: Option<OwnedHandle>,
+}
+
+struct Source<T> {
+    input: Option<T>,
+    retry_at: Instant,
+}
+
+impl<T> Source<T> {
+    fn new(now: Instant) -> Self {
+        Self {
+            input: None,
+            retry_at: now,
+        }
+    }
+
+    fn poll(
+        &mut self,
+        now: Instant,
+        open: impl FnOnce() -> Result<T>,
+        read: impl FnOnce(&mut T) -> Result<()>,
+    ) {
+        if self.input.is_none() {
+            if now < self.retry_at {
+                return;
+            }
+            self.input = open().ok();
+        }
+        if self.input.as_mut().is_none_or(|input| read(input).is_err()) {
+            self.input = None;
+            self.retry_at = now + RECONNECT_INTERVAL;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -116,7 +151,10 @@ impl PacketQueue {
             return;
         }
         let estimated = position.unwrap_or(now - frames as i64);
-        let first = self.first.get_or_insert(estimated.max(cursor));
+        if self.first.is_none() && estimated + frames as i64 <= cursor {
+            return;
+        }
+        let first = self.first.get_or_insert(estimated);
         let end = *first + self.samples.len() as i64;
         let delta = estimated - end;
         let interrupted =
@@ -195,7 +233,12 @@ impl Input {
                 device
             }
         };
-        let format = WAVEFORMATEX {
+        let client = unsafe { device.Activate(CLSCTX_ALL, None)? };
+        Self::initialize(client, loopback, false)
+    }
+
+    fn initialize(client: IAudioClient, loopback: bool, process: bool) -> Result<Self> {
+        let pcm = WAVEFORMATEX {
             wFormatTag: 1,
             nChannels: 2,
             nSamplesPerSec: RATE as u32,
@@ -206,25 +249,61 @@ impl Input {
         };
         let mut flags =
             AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        let float = WAVEFORMATEXTENSIBLE {
+            Format: WAVEFORMATEX {
+                wFormatTag: 0xfffe,
+                nAvgBytesPerSec: (RATE * 8) as u32,
+                nBlockAlign: 8,
+                wBitsPerSample: 32,
+                cbSize: (size_of::<WAVEFORMATEXTENSIBLE>() - size_of::<WAVEFORMATEX>()) as u16,
+                ..pcm
+            },
+            Samples: WAVEFORMATEXTENSIBLE_0 {
+                wValidBitsPerSample: 32,
+            },
+            dwChannelMask: 3,
+            SubFormat: GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71),
+        };
         if loopback {
             flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
         }
         unsafe {
-            let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
-            client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 5_000_000, 0, &format, None)?;
+            let event = if process {
+                // Process loopback can use the engine's native float PCM directly.
+                flags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+                let handle = CreateEventW(None, false, false, PCWSTR::null())?;
+                Some(OwnedHandle::from_raw_handle(handle.0))
+            } else {
+                None
+            };
+            client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                flags,
+                5_000_000,
+                0,
+                if process { &float.Format } else { &pcm },
+                None,
+            )?;
+            if let Some(event) = &event {
+                client.SetEventHandle(HANDLE(event.as_raw_handle()))?;
+            }
             let capture = client.GetService()?;
             client.Start()?;
             Ok(Self {
                 client,
                 capture,
                 queue: PacketQueue::default(),
+                _event: event,
             })
         }
     }
 
     fn read(&mut self, origin: i64, now: i64, cursor: i64) -> Result<()> {
         unsafe {
-            while self.capture.GetNextPacketSize()? > 0 {
+            for _ in 0..64 {
+                if self.capture.GetNextPacketSize()? == 0 {
+                    break;
+                }
                 let mut data = std::ptr::null_mut();
                 let (mut frames, mut flags, mut timestamp) = (0, 0, 0);
                 self.capture.GetBuffer(
@@ -243,6 +322,11 @@ impl Input {
                     |i| {
                         if silent {
                             [0; 2]
+                        } else if self._event.is_some() {
+                            data.add(i * 8)
+                                .cast::<[f32; 2]>()
+                                .read_unaligned()
+                                .map(|sample| (sample * 32_768.0) as i16)
                         } else {
                             data.add(i * 4).cast::<Stereo>().read_unaligned()
                         }
@@ -253,6 +337,9 @@ impl Input {
                     flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0,
                 );
                 self.capture.ReleaseBuffer(frames)?;
+                if frames == 0 {
+                    break;
+                }
             }
         }
         Ok(())
@@ -265,8 +352,35 @@ impl Drop for Input {
     }
 }
 
+#[derive(Default)]
+struct AppInput {
+    input: Option<Input>,
+    process: Option<ProcessAudio>,
+}
+
+impl AppInput {
+    fn read(&mut self, origin: i64, now: i64, cursor: i64) -> Result<()> {
+        if let Some(process) = &mut self.process {
+            if !process.alive() {
+                *self = Self::default();
+                return Ok(());
+            }
+            if self.input.is_none()
+                && let Some(client) = process.client()?
+            {
+                self.input = Some(Input::initialize(client, true, true)?);
+            }
+        }
+        if let Some(input) = &mut self.input {
+            input.read(origin, now, cursor)?;
+        }
+        Ok(())
+    }
+}
+
 pub struct Feed {
     pub name: String,
+    pub channels: usize,
     stop: Arc<AtomicBool>,
     level: Arc<AtomicU16>,
     thread: Option<JoinHandle<Result<()>>>,
@@ -276,7 +390,12 @@ impl Feed {
     pub fn spawn(settings: &Settings, synthetic: bool, tag: &str) -> Result<Option<Self>> {
         let system = settings.active_tracks().any(|(_, enabled, _)| enabled);
         let mic = settings.active_tracks().any(|(_, _, enabled)| enabled);
-        if !system && !mic {
+        let apps: Vec<String> = settings
+            .applications()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        if !system && !mic && apps.is_empty() {
             return Ok(None);
         }
         let name = format!(r"\\.\pipe\rewind-{}-{tag}", std::process::id());
@@ -305,17 +424,20 @@ impl Feed {
         let stop_for_thread = Arc::clone(&stop);
         let level = Arc::new(AtomicU16::new(0));
         let level_for_thread = Arc::clone(&level);
+        let channels = 4 + apps.len() * 2;
         let thread = thread::spawn(move || {
             run_feed(
                 &handle,
                 &stop_for_thread,
                 &level_for_thread,
                 &ids,
+                &apps,
                 synthetic,
             )
         });
         Ok(Some(Self {
             name,
+            channels,
             stop,
             level,
             thread: Some(thread),
@@ -353,6 +475,7 @@ fn run_feed(
     stop: &AtomicBool,
     level: &AtomicU16,
     ids: &[Option<String>; 2],
+    apps: &[String],
     synthetic: bool,
 ) -> Result<()> {
     let _com = Com::new()?;
@@ -391,21 +514,13 @@ fn run_feed(
     let clock = |counter: i64| {
         (counter / frequency) * 10_000_000 + (counter % frequency) * 10_000_000 / frequency
     };
-    let mut inputs = [None, None];
-    if !synthetic {
-        for (index, id) in ids.iter().enumerate() {
-            if let Some(id) = id {
-                inputs[index] = Some(Input::start(id, index == 0).with_context(|| {
-                    if index == 0 {
-                        "Не удалось захватить системный звук"
-                    } else {
-                        "Не удалось открыть микрофон"
-                    }
-                })?);
-            }
-        }
-    }
-    let mut data = [0_u8; BLOCK * 8];
+    let packet_origin = clock(origin);
+    let started_at = Instant::now();
+    let mut sources = [Source::new(started_at), Source::new(started_at)];
+    let mut app_inputs: Vec<_> = apps.iter().map(|_| AppInput::default()).collect();
+    let mut next_scan = started_at;
+    let frame_bytes = (2 + apps.len()) * 4;
+    let mut data = vec![0_u8; BLOCK * frame_bytes];
     let mut cursor = 0;
     let mut pending = data.len();
     let mut deadline = Instant::now();
@@ -413,8 +528,36 @@ fn run_feed(
         let mut now = 0;
         unsafe { QueryPerformanceCounter(&mut now)? };
         let now = (now - origin) * RATE / frequency;
-        for input in inputs.iter_mut().flatten() {
-            input.read(clock(origin), now, cursor)?;
+        if !synthetic {
+            let instant = Instant::now();
+            for (index, (source, id)) in sources.iter_mut().zip(ids).enumerate() {
+                if let Some(id) = id {
+                    // Keep writing PCM for both sources while an endpoint is unavailable.
+                    source.poll(
+                        instant,
+                        || Input::start(id, index == 0),
+                        |input| input.read(packet_origin, now, cursor),
+                    );
+                }
+            }
+            if instant >= next_scan && app_inputs.iter().any(|app| app.process.is_none()) {
+                next_scan = instant + RECONNECT_INTERVAL;
+                let running = applications::matching(apps);
+                for (app, path) in app_inputs.iter_mut().zip(apps) {
+                    if app.process.is_none()
+                        && let Some(target) = running
+                            .iter()
+                            .find(|target| path.eq_ignore_ascii_case(&target.path))
+                    {
+                        app.process = ProcessAudio::start(target).ok();
+                    }
+                }
+            }
+            for app in &mut app_inputs {
+                if app.read(packet_origin, now, cursor).is_err() {
+                    *app = AppInput::default();
+                }
+            }
         }
         if pending < data.len() {
             let mut written = 0;
@@ -436,23 +579,29 @@ fn run_feed(
             continue;
         }
         let mut peak = 0;
-        for (index, row) in data.chunks_exact_mut(8).enumerate() {
+        for (index, row) in data.chunks_exact_mut(frame_bytes).enumerate() {
             let position = cursor + index as i64;
-            for source in 0..2 {
+            for (source, bytes) in row.chunks_exact_mut(4).enumerate() {
                 let sample = if synthetic {
-                    let phase = position as f64 * [440.0, 880.0][source] * std::f64::consts::TAU
-                        / RATE as f64;
+                    let phase =
+                        position as f64 * ((source + 1) as f64 * 440.0) * std::f64::consts::TAU
+                            / RATE as f64;
                     [(phase.sin() * 4_000.0) as i16; 2]
                 } else {
-                    inputs[source]
+                    let input = if source < 2 {
+                        &mut sources[source].input
+                    } else {
+                        &mut app_inputs[source - 2].input
+                    };
+                    input
                         .as_mut()
                         .map_or([0; 2], |input| input.queue.sample(position))
                 };
                 peak = peak
                     .max(sample[0].unsigned_abs())
                     .max(sample[1].unsigned_abs());
-                row[source * 4..source * 4 + 2].copy_from_slice(&sample[0].to_le_bytes());
-                row[source * 4 + 2..source * 4 + 4].copy_from_slice(&sample[1].to_le_bytes());
+                bytes[..2].copy_from_slice(&sample[0].to_le_bytes());
+                bytes[2..].copy_from_slice(&sample[1].to_le_bytes());
             }
         }
         level.fetch_max(peak, Ordering::Relaxed);
@@ -465,6 +614,46 @@ fn run_feed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_endpoint_retries_without_reopening_the_other_source() {
+        let now = Instant::now();
+        let mut system = Source::new(now);
+        let mut mic = Source::new(now);
+        system.poll(now, || Ok(1), |_| Ok(()));
+        mic.poll(now, || Ok(2), |_| Ok(()));
+
+        let fault = || windows::core::Error::from_hresult(AUDCLNT_E_DEVICE_INVALIDATED).into();
+        system.poll(now, || unreachable!(), |_| Err(fault()));
+        mic.poll(
+            now,
+            || unreachable!(),
+            |input| {
+                *input += 1;
+                Ok(())
+            },
+        );
+        assert!(system.input.is_none());
+        assert_eq!(mic.input, Some(3));
+
+        system.poll(now, || unreachable!(), |_| unreachable!());
+        let retry = now + RECONNECT_INTERVAL;
+        system.poll(retry, || Err(fault()), |_| unreachable!());
+        assert!(system.input.is_none());
+        system.poll(retry + RECONNECT_INTERVAL, || Ok(4), |_| Ok(()));
+        assert_eq!(system.input, Some(4));
+    }
+
+    #[test]
+    fn reopened_endpoint_discards_samples_before_the_output_cursor() {
+        let mut queue = PacketQueue::default();
+        queue.push(6, |_| [99; 2], Some(9_990), 10_003, 10_000, false);
+        queue.push(6, |i| [i as i16 + 1; 2], Some(9_997), 10_003, 10_000, false);
+        assert_eq!(queue.sample(10_000), [4; 2]);
+        assert_eq!(queue.sample(10_001), [5; 2]);
+        assert_eq!(queue.sample(10_002), [6; 2]);
+        assert_eq!(queue.sample(10_003), [0; 2]);
+    }
 
     #[test]
     fn packet_timestamp_jitter_does_not_interrupt_pcm() {

@@ -41,6 +41,8 @@ function icon(element, name = element.dataset.icon) {
 all("[data-icon]").forEach((element) => icon(element));
 
 let settings;
+let applications = [];
+let update = { state: "idle", version: null };
 let shortcut = true;
 let saving = false;
 let phase = "idle";
@@ -109,12 +111,14 @@ function goto(next, focus = false) {
 function addTrack(track, animate = false) {
   const row = document.createElement("div");
   row.className = animate ? "track new" : "track";
-  row.innerHTML = '<input name="track_name" type="text" maxlength="48" required><label><input class="switch" type="checkbox" name="track_system"><span></span></label><label><input class="switch" type="checkbox" name="track_microphone"><span></span></label><button type="button" class="pill remove"><span data-icon="close"></span></button>';
+  row.innerHTML = '<input name="track_name" type="text" maxlength="48" required><label><input class="switch" type="checkbox" name="track_system"><span></span></label><label><input class="switch" type="checkbox" name="track_microphone"><span></span></label><select name="track_application"></select><button type="button" class="pill remove"><span data-icon="close"></span></button>';
   labelTrack(row);
   const name = row.querySelector("[name=track_name]");
   name.value = track.name;
   row.querySelector("[name=track_system]").checked = track.system;
   row.querySelector("[name=track_microphone]").checked = track.microphone;
+  listApplications(row.querySelector("[name=track_application]"), track.application ?? "");
+  updateTrackSources(row);
   icon(row.querySelector("[data-icon]"));
   row.querySelector(".remove").addEventListener("click", () => {
     row.remove();
@@ -130,7 +134,26 @@ function labelTrack(row) {
   row.querySelector("[name=track_name]").setAttribute("aria-label", t("Название дорожки"));
   row.querySelector("[name=track_system] + span").textContent = t("Система");
   row.querySelector("[name=track_microphone] + span").textContent = t("Микрофон");
+  row.querySelector("[name=track_application]").setAttribute("aria-label", t("Приложение"));
   row.querySelector(".remove").setAttribute("aria-label", t("Удалить дорожку"));
+}
+
+function updateTrackSources(row) {
+  const system = row.querySelector("[name=track_system]");
+  const microphone = row.querySelector("[name=track_microphone]");
+  const application = row.querySelector("[name=track_application]");
+  system.disabled = microphone.disabled = Boolean(application.value);
+  application.disabled = system.checked || microphone.checked;
+}
+
+function listApplications(select, current = select.value) {
+  const options = [new Option(t("Без приложения"), "")];
+  for (const app of applications) options.push(new Option(app.name, app.path));
+  if (current && !applications.some((app) => app.path === current)) {
+    options.push(new Option(current.split(/[\\/]/).at(-1) + " · " + t("Закрыто"), current));
+  }
+  select.replaceChildren(...options);
+  select.value = current;
 }
 
 const numeric = ["width", "height", "fps", "bitrate", "seconds", "shortcut", "audio_bitrate", "system_volume", "microphone_volume"];
@@ -204,7 +227,7 @@ function storage() {
 }
 
 function activeTracks(tracks, system, mic) {
-  return tracks.filter((track) => (track.system && system) || (track.microphone && mic)).length;
+  return tracks.filter((track) => (track.system && system) || (track.microphone && mic) || track.application).length;
 }
 
 function trackValues() {
@@ -212,6 +235,7 @@ function trackValues() {
     name: row.querySelector("[name=track_name]").value,
     system: row.querySelector("[name=track_system]").checked,
     microphone: row.querySelector("[name=track_microphone]").checked,
+    application: row.querySelector("[name=track_application]").value || null,
   }));
 }
 
@@ -223,9 +247,34 @@ function refreshControls() {
   const disabled = locked();
   all(".editable").forEach((group) => { group.disabled = disabled; });
   all(".apply").forEach((button) => { button.disabled = disabled || !dirty; });
-  $("#add-track").disabled = disabled || $("#tracks").childElementCount >= 6;
+  $("#add-track").disabled = disabled || $("#tracks").childElementCount >= 10;
+  $("#install-update").disabled = phase !== "idle" || saving || pendingAction;
   if (phase === "downloading") feedback(t("Дождитесь установки FFmpeg."));
   else if (phase !== "idle" || saving) feedback(t("Остановите буфер и дождитесь сохранения клипа, чтобы изменить настройки."));
+}
+
+function showUpdate() {
+  if (!document.querySelector("dialog[open]")) $("#update-prompt").showModal();
+}
+
+function refreshUpdate() {
+  const { state, version } = update;
+  const downloadReady = state === "available" || state === "download_error";
+  const message = {
+    checking: "Проверяем обновления…",
+    current: "У вас последняя версия.",
+    available: "Новая версия Rewind",
+    downloading: "Скачиваем обновление…",
+    downloaded: "Обновление загружено. Перед установкой сохраните нужный повтор и остановите запись.",
+    check_error: "Не удалось проверить обновления.",
+    download_error: "Не удалось загрузить или установить обновление.",
+  }[state];
+  onText("#update-status", message ? t(message) + (state === "available" ? " v" + version : "") : "");
+  $("#update-status").hidden = !message;
+  $("#check-update").disabled = ["checking", "downloading", "downloaded"].includes(state);
+  $("#show-update").hidden = !downloadReady;
+  $("#install-update").hidden = state !== "downloaded";
+  onText("#update-version", version ? "v" + version : "");
 }
 
 function edit(event) {
@@ -372,11 +421,14 @@ window.rewind = {
   preferences({ preferences, locale, tray, version }) {
     for (const name of preferenceNames) field(name).value = preferences[name];
     field("start_with_windows").checked = preferences.start_with_windows;
+    field("auto_update").checked = preferences.auto_update;
     field("close_behavior").querySelector('option[value="tray"]').disabled = !tray;
     onText("#app-version", "v" + version);
     if (locale === language()) return;
     localize(locale);
     all(".track").forEach(labelTrack);
+    all("[name=track_application]").forEach((select) => listApplications(select));
+    refreshUpdate();
     all("option[data-message]").forEach((option) => { option.textContent = t(option.dataset.message); });
     all("option[data-primary]").forEach((option) => { option.textContent = option.dataset.primary + " · " + t("Основной"); });
     if (settings) {
@@ -390,6 +442,15 @@ window.rewind = {
   },
   preferencesSaved() {
     onText("#preferences-feedback", t("Настройки сохранены."));
+  },
+  applications(list) {
+    applications = list;
+    all("[name=track_application]").forEach((select) => listApplications(select));
+  },
+  updateState(result) {
+    update = result;
+    refreshUpdate();
+    if (result.state === "available") showUpdate();
   },
   preferencesSaveError() {
     onText("#preferences-feedback", t("Не удалось сохранить настройки"));
@@ -521,6 +582,7 @@ document.addEventListener("click", (event) => {
   if (button.dataset.page) goto(button.dataset.page, !button.matches(".tab"));
   if (button.dataset.action) ipc(button.dataset.action);
   if (button.dataset.browse) void browsePath(button.dataset.browse);
+  if (button.id === "show-update") showUpdate();
   if (button.id === "primary" && button.dataset.command) {
     pendingAction = true;
     button.disabled = true;
@@ -528,17 +590,25 @@ document.addEventListener("click", (event) => {
   }
   if (button.matches(".apply")) apply();
   if (button.id === "add-track") {
-    addTrack({ name: t("Дорожка") + " " + ($("#tracks").childElementCount + 1), system: true, microphone: false }, true);
+    addTrack({ name: t("Дорожка") + " " + ($("#tracks").childElementCount + 1), system: false, microphone: false }, true);
     edit();
   }
 });
 document.addEventListener("input", (event) => {
+  const row = event.target.closest(".track");
+  if (row) updateTrackSources(row);
   if (event.target.closest(".editable")) edit(event);
 });
+$("#update-prompt").addEventListener("submit", (event) => {
+  event.preventDefault();
+  $("#update-prompt").close();
+  if (event.submitter?.value === "download") ipc("download_update");
+});
+document.querySelector('.tab[data-page="audio"]').addEventListener("click", () => ipc("refresh_applications"));
 field("mode").addEventListener("change", mode);
 field("automatic_capture").addEventListener("change", mode);
 field("native_resolution").addEventListener("change", resolutionMode);
-for (const name of [...preferenceNames, "start_with_windows"]) {
+for (const name of [...preferenceNames, "start_with_windows", "auto_update"]) {
   field(name).addEventListener("change", () => {
     onText("#preferences-feedback", t("Сохраняем настройки…"));
     ipc("preferences", { preferences: {
@@ -546,6 +616,7 @@ for (const name of [...preferenceNames, "start_with_windows"]) {
       close_behavior: field("close_behavior").value,
       interface_scale: Number(field("interface_scale").value),
       start_with_windows: field("start_with_windows").checked,
+      auto_update: field("auto_update").checked,
     } });
   });
 }

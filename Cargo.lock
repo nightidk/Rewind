@@ -2653,11 +2653,12 @@ dependencies = [
 
 [[package]]
 name = "rewind"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
  "dirs",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -2665,6 +2666,7 @@ dependencies = [
  "tauri-build",
  "tempfile",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

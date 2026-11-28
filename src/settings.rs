@@ -40,6 +40,7 @@ pub struct Preferences {
     pub close_behavior: CloseBehavior,
     pub interface_scale: u16,
     pub start_with_windows: bool,
+    pub auto_update: bool,
 }
 
 impl Default for Preferences {
@@ -49,6 +50,7 @@ impl Default for Preferences {
             close_behavior: CloseBehavior::default(),
             interface_scale: 100,
             start_with_windows: false,
+            auto_update: true,
         }
     }
 }
@@ -104,7 +106,11 @@ pub struct Track {
     pub name: String,
     pub system: bool,
     pub microphone: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application: Option<String>,
 }
+
+pub const MAX_TRACKS: usize = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -166,6 +172,7 @@ impl Default for Settings {
                 name: Locale::system().text("Микс").into_owned(),
                 system: true,
                 microphone: true,
+                application: None,
             }],
         }
     }
@@ -175,7 +182,18 @@ impl Settings {
     pub fn load(directory: &Path) -> Result<Self> {
         let path = directory.join("settings.json");
         match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).context("Ошибка чтения настроек"),
+            Ok(bytes) => {
+                let mut settings: Self =
+                    serde_json::from_slice(&bytes).context("Ошибка чтения настроек")?;
+                // Keep the selected app in tracks saved before the sources became exclusive.
+                for track in &mut settings.tracks {
+                    if track.application.is_some() {
+                        track.system = false;
+                        track.microphone = false;
+                    }
+                }
+                Ok(settings)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(error).context("Ошибка чтения настроек"),
         }
@@ -232,8 +250,8 @@ impl Settings {
             "Громкость должна быть от 0 до 200%."
         );
         ensure!(
-            self.tracks.len() <= 6,
-            "В одном клипе можно сохранить до шести дорожек."
+            self.tracks.len() <= MAX_TRACKS,
+            "В одном клипе можно сохранить до десяти дорожек."
         );
         for track in &self.tracks {
             ensure!(
@@ -243,9 +261,19 @@ impl Settings {
                 "Название дорожки должно содержать от 1 до 48 символов."
             );
             ensure!(
-                track.system || track.microphone,
+                track.system || track.microphone || track.application.is_some(),
                 "Выберите источник для каждой дорожки или удалите пустую строку."
             );
+            if let Some(path) = &track.application {
+                ensure!(
+                    !track.system && !track.microphone,
+                    "Для дорожки приложения отключите систему и микрофон."
+                );
+                ensure!(
+                    Path::new(path).is_absolute(),
+                    "Укажите полный путь к приложению."
+                );
+            }
         }
         Ok(())
     }
@@ -254,9 +282,44 @@ impl Settings {
         self.tracks.iter().filter_map(|track| {
             let system = track.system && !self.system_device.is_empty();
             let mic = track.microphone && !self.microphone_device.is_empty();
-            (system || mic).then_some((track, system, mic))
+            (system || mic || track.application.is_some()).then_some((track, system, mic))
         })
     }
+
+    pub fn applications(&self) -> Vec<&str> {
+        let mut apps: Vec<&str> = Vec::new();
+        for app in self
+            .tracks
+            .iter()
+            .filter_map(|track| track.application.as_deref())
+        {
+            if !apps.iter().any(|path| path.eq_ignore_ascii_case(app)) {
+                apps.push(app);
+            }
+        }
+        apps
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn legacy_mixed_application_tracks_keep_the_application() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let mut settings = Settings::default();
+    settings.tracks[0].application = Some(
+        directory
+            .path()
+            .join("app.exe")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    assert!(settings.validate().is_err());
+    settings.write(directory.path())?;
+    let loaded = Settings::load(directory.path())?;
+    loaded.validate()?;
+    assert_eq!(loaded.tracks[0].application, settings.tracks[0].application);
+    assert!(!loaded.tracks[0].system && !loaded.tracks[0].microphone);
+    Ok(())
 }
 
 #[cfg(test)]

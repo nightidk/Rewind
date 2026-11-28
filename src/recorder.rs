@@ -363,6 +363,12 @@ impl Session {
         };
         let dxgi = matches!(mode, Some(CaptureMode::Dxgi));
         if let Some(feed) = &audio {
+            let apps = settings.applications();
+            let layout = if apps.is_empty() {
+                "quad".to_owned()
+            } else {
+                format!("{}C", feed.channels)
+            };
             cmd.args([
                 "-thread_queue_size",
                 "256",
@@ -371,9 +377,9 @@ impl Session {
                 "-ar",
                 "48000",
                 "-ac",
-                "4",
+                &feed.channels.to_string(),
                 "-channel_layout",
-                "quad",
+                &layout,
                 "-probesize",
                 "32",
                 "-analyzeduration",
@@ -390,7 +396,7 @@ impl Session {
                     .collect::<String>();
                 filter.push_str(&format!("{audio_source}asplit={track_count}{outputs};"));
             }
-            for (index, (_, system, microphone)) in settings.active_tracks().enumerate() {
+            for (index, (track, system, microphone)) in settings.active_tracks().enumerate() {
                 let system = f64::from(if system { settings.system_volume } else { 0 }) / 100.0;
                 let mic = f64::from(if microphone {
                     settings.microphone_volume
@@ -406,7 +412,12 @@ impl Session {
                     format!("[s{index}]")
                 };
                 filter.push_str(&input);
-                filter.push_str(&audio_route(system, mic));
+                let app = track.application.as_ref().and_then(|path| {
+                    apps.iter()
+                        .position(|app| app.eq_ignore_ascii_case(path))
+                        .map(|index| 4 + index * 2)
+                });
+                filter.push_str(&audio_route(system, mic, app));
                 filter.push_str(&format!("[a{index}]"));
             }
             cmd.args(["-filter_complex", &filter]);
@@ -712,7 +723,10 @@ impl Session {
     }
 }
 
-fn audio_route(system: f64, mic: f64) -> String {
+fn audio_route(system: f64, mic: f64, app: Option<usize>) -> String {
+    if let Some(app) = app {
+        return format!("pan=stereo|c0=c{app}|c1=c{}", app + 1);
+    }
     let pan = format!("pan=stereo|c0={system}*c0+{mic}*c2|c1={system}*c1+{mic}*c3");
     if system > 0.0 && mic > 0.0 && system + mic > 1.0 {
         // Float samples retain peaks above full scale until the limiter can attenuate them.
@@ -1228,7 +1242,7 @@ mod tests {
                 "-i",
                 &source,
                 "-af",
-                &audio_route(1.0, 1.0),
+                &audio_route(1.0, 1.0, None),
                 "-f",
                 "s16le",
                 "pipe:1",
@@ -1253,7 +1267,7 @@ mod tests {
     #[ignore = "requires FFmpeg and FFprobe in PATH and runs the capture clock"]
     fn bounded_ring_exports_named_mix_and_separate_tracks() -> Result<()> {
         let temp = tempfile::tempdir_in(std::env::current_dir()?.join("target"))?;
-        let settings = Settings {
+        let mut settings = Settings {
             seconds: 10,
             output: temp.path().join("Клипы с пробелом"),
             width: 640,
@@ -1268,20 +1282,37 @@ mod tests {
                     name: "Микс".into(),
                     system: true,
                     microphone: true,
+                    application: None,
                 },
                 Track {
                     name: "Система".into(),
                     system: true,
                     microphone: false,
+                    application: None,
                 },
                 Track {
                     name: "Микрофон".into(),
                     system: false,
                     microphone: true,
+                    application: None,
                 },
             ],
             ..Settings::default()
         };
+        settings.tracks.extend((0..7).map(|index| {
+            Track {
+                name: format!("Приложение {}", index + 1),
+                system: false,
+                microphone: false,
+                application: Some(
+                    temp.path()
+                        .join(format!("app-{index}.exe"))
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            }
+        }));
+        settings.validate()?;
         settings.write(temp.path())?;
         let settings = Settings::load(temp.path())?;
         let mut recorder = Recorder::default();
@@ -1368,7 +1399,7 @@ mod tests {
         let probe: serde_json::Value = serde_json::from_slice(&output.stdout)?;
         let streams = probe["streams"].as_array().context("Missing streams")?;
         let packets = probe["packets"].as_array().context("Missing packets")?;
-        assert_eq!(streams.len(), 4);
+        assert_eq!(streams.len(), 11);
         assert_eq!(streams[0]["codec_name"], "h264");
         assert_eq!(streams[0]["width"], 320);
         assert_eq!(streams[0]["height"], 180);
@@ -1454,6 +1485,9 @@ mod tests {
             let mic_level = level(880.0);
             assert_eq!(system_level > 500.0, track.system);
             assert_eq!(mic_level > 500.0, track.microphone);
+            if track.application.is_some() {
+                assert!(level(index as f64 * 440.0) > 500.0);
+            }
             levels.push([system_level, mic_level]);
         }
         for gain in [levels[0][0] / levels[1][0], levels[0][1] / levels[2][1]] {
@@ -1510,6 +1544,7 @@ mod tests {
                 name: name.into(),
                 system: true,
                 microphone: false,
+                application: None,
             }],
             ..Settings::default()
         };

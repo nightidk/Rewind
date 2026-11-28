@@ -37,7 +37,7 @@ pub fn find(preferred: &Path, data: &Path) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-fn system_directory() -> Result<PathBuf> {
+pub(crate) fn system_directory() -> Result<PathBuf> {
     let mut buffer = [0; 1024];
     let len = unsafe { GetSystemDirectoryW(Some(&mut buffer)) as usize };
     ensure!(

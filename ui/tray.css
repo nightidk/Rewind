@@ -14,7 +14,7 @@
 .tray progress { display: block; appearance: none; width: 100%; height: 5px; border: 0; }
 .tray progress::-webkit-progress-bar { background: var(--line); border-radius: 2px; }
 .tray progress::-webkit-progress-value { background: var(--green); border-radius: 2px; transition: width 220ms ease-out; }
-.tray .tray-save { min-height: 37px; font-size: 13px; }
+.tray .tray-save, .tray .tray-record { min-height: 37px; font-size: 13px; }
 .tray-save kbd { color: #404349; border-color: #a1a4ab; padding-inline: 5px; }
 .tray-actions { display: flex; gap: 8px; }
 .tray-actions .pill { min-height: 32px; font-size: 12px; }

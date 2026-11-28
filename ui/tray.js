@@ -12,7 +12,7 @@ const text = (selector, value) => {
 };
 
 window.rewind = {
-  status({ phase, seconds, limit, saving, shortcut, locale }) {
+  status({ phase, seconds, limit, saving, shortcut, locale, toggle_label, toggle_enabled }) {
     localize(locale);
     document.body.dataset.phase = phase;
     text("#record-state", t({
@@ -26,7 +26,12 @@ window.rewind = {
     text("#limit", "/ " + time(limit));
     $("#buffer").max = limit;
     $("#buffer").value = seconds;
-    $("[data-action=save]").disabled = saving || phase === "downloading" || phase === "stopping" || (phase === "idle" && !seconds);
+    const save = $("[data-action=save]");
+    save.disabled = saving || phase === "downloading" || phase === "stopping" || (phase === "idle" && !seconds);
+    text("#buffer-toggle", t(toggle_label));
+    const toggle = $("#buffer-toggle");
+    toggle.disabled = !toggle_enabled;
+    toggle.classList.toggle("primary", phase === "idle" && save.disabled);
     text("#save-label", t(saving ? "Сохраняем…" : "Сохранить повтор"));
     $("#shortcut").hidden = !shortcut || saving;
     if (shortcut) text("#shortcut", "Alt + F" + shortcut);

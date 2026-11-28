@@ -25,7 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PCWSTR;
 
 const WIDTH: f64 = 328.0;
-const HEIGHT: f64 = 224.0;
+const HEIGHT: f64 = 270.0;
 const ESCAPE_HOTKEY: i32 = 1;
 
 thread_local! {
@@ -40,6 +40,17 @@ struct PanelStatus {
     limit: u32,
     saving: bool,
     shortcut: Option<u32>,
+    toggle_label: &'static str,
+    toggle_enabled: bool,
+}
+
+pub fn buffer_control(phase: &str, saving: bool) -> (&'static str, bool) {
+    match phase {
+        "idle" => ("Включить буфер", !saving),
+        "downloading" => ("Отменить", true),
+        "stopping" => ("Завершаем запись", false),
+        _ => ("Остановить буфер", true),
+    }
 }
 
 pub struct TrayPanel {
@@ -182,6 +193,7 @@ impl TrayPanel {
         if !self.view.is_visible().unwrap_or(false) {
             return;
         }
+        let (toggle_label, toggle_enabled) = buffer_control(status.phase, status.saving);
         let state = PanelStatus {
             locale,
             phase: status.phase,
@@ -189,6 +201,8 @@ impl TrayPanel {
             limit,
             saving: status.saving,
             shortcut,
+            toggle_label,
+            toggle_enabled,
         };
         if self.last.as_ref() != Some(&state) {
             ipc(&self.view, "status", &state);

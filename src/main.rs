@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod applications;
 mod audio;
 mod ffmpeg;
 mod localization;
@@ -9,6 +10,7 @@ mod recorder;
 mod settings;
 mod startup;
 mod tray_panel;
+mod updater;
 mod window_events;
 
 use std::ffi::OsStr;
@@ -70,6 +72,10 @@ enum Request {
         settings: Box<Settings>,
     },
     RefreshDevices,
+    RefreshApplications,
+    CheckUpdate,
+    DownloadUpdate,
+    InstallUpdate,
     OpenFolder,
     OpenClip,
     OpenRepository,
@@ -97,9 +103,12 @@ enum AppEvent {
     Request(Request),
     Hotkey,
     Devices(Result<[Vec<audio::Device>; 2]>),
+    UpdateChecked(Result<Option<updater::Update>>),
+    UpdateDownloaded(Result<updater::Download>),
     FfmpegInstalled(Result<PathBuf>),
     TrayMenu(PhysicalPosition<f64>),
     TrayReady,
+    ToggleBuffer,
     DismissTray,
     Show,
     Quit,
@@ -139,6 +148,7 @@ fn tray_action(
         "dismiss" => AppEvent::DismissTray,
         "open" => AppEvent::Show,
         "save" => AppEvent::Hotkey,
+        "toggle_buffer" => AppEvent::ToggleBuffer,
         "quit" => AppEvent::Quit,
         _ => return Err("Неизвестная команда меню.".into()),
     };
@@ -364,6 +374,9 @@ fn open_buffers(directory: &Path) -> Result<PathBuf> {
 
 fn run() -> Result<()> {
     let windows_startup = std::env::args_os().any(|arg| arg == startup::ARGUMENT);
+    let Some(_instance) = window_events::single_instance(!windows_startup)? else {
+        return Ok(());
+    };
     let (directory, lock) = match open_data() {
         Err(error)
             if windows_startup
@@ -479,6 +492,7 @@ fn run() -> Result<()> {
             };
             let _ = tray_proxy.send(event);
         });
+    let mut fallback_toggle = None;
     if !custom_tray {
         let locale = settings.preferences.language.resolve();
         let open = MenuItem::with_id(
@@ -496,15 +510,30 @@ fn run() -> Result<()> {
             None::<&str>,
         )?;
         let quit = MenuItem::with_id(&app, "quit", locale.text("Выйти"), true, None::<&str>)?;
+        let toggle = MenuItem::with_id(
+            &app,
+            "toggle_buffer",
+            locale.text("Включить буфер"),
+            true,
+            None::<&str>,
+        )?;
         let menu = Menu::with_items(
             &app,
-            &[&open, &save, &PredefinedMenuItem::separator(&app)?, &quit],
+            &[
+                &open,
+                &toggle,
+                &save,
+                &PredefinedMenuItem::separator(&app)?,
+                &quit,
+            ],
         )?;
+        fallback_toggle = Some(toggle);
         let menu_proxy = proxy.clone();
         tray_builder = tray_builder.menu(&menu).on_menu_event(move |_, event| {
             let event = match event.id().as_ref() {
                 "open" => AppEvent::Show,
                 "save" => AppEvent::Hotkey,
+                "toggle_buffer" => AppEvent::ToggleBuffer,
                 "quit" => AppEvent::Quit,
                 _ => return,
             };
@@ -537,6 +566,11 @@ fn run() -> Result<()> {
     let mut downloading: Option<Arc<AtomicBool>> = None;
     let mut start_on_ready = windows_startup && settings.resume_buffer;
     let mut buffer_active = false;
+    let mut update_status = "idle";
+    let mut available_update: Option<updater::Update> = None;
+    let mut staged_update: Option<updater::Download> = None;
+    let mut next_update_check = Instant::now();
+    let mut fallback_state = None;
     app.run_return(move |app, event| {
         let _ = (&lock, &window_events, &keep_ticking);
         let start_capture = |recorder: &mut Recorder, displays: &mut Vec<Display>, settings: &Settings| {
@@ -568,6 +602,8 @@ fn run() -> Result<()> {
                 panel.hide();
             }
             let due = matches!(event, AppEvent::Tick);
+            let new_frontend = matches!(event, AppEvent::Request(Request::Ready));
+            let update_before = update_status;
             let capture_action = matches!(
                 &event,
                 AppEvent::Request(Request::Start | Request::Stop | Request::FfmpegChoice { choice: FfmpegChoice::Download | FfmpegChoice::Path { .. } })
@@ -590,6 +626,19 @@ fn run() -> Result<()> {
                 AppEvent::DismissTray => {
                     if let Some(panel) = &mut tray_panel {
                         panel.hide();
+                    }
+                    Ok(())
+                }
+                AppEvent::ToggleBuffer => {
+                    let status = recorder.status();
+                    let phase = if downloading.is_some() { "downloading" } else { status.phase };
+                    if !quitting && tray_panel::buffer_control(phase, status.saving).1 {
+                        if awaiting_ffmpeg {
+                            show(&view);
+                        } else {
+                            let request = if phase == "idle" { Request::Start } else { Request::Stop };
+                            let _ = proxy.send(AppEvent::Request(request));
+                        }
                     }
                     Ok(())
                 }
@@ -621,6 +670,27 @@ fn run() -> Result<()> {
                     }
                     Ok(())
                 }
+                AppEvent::UpdateChecked(result) => {
+                    update_status = match result {
+                        Ok(Some(update)) => {
+                            available_update = Some(update);
+                            "available"
+                        }
+                        Ok(None) => "current",
+                        Err(_) => "check_error",
+                    };
+                    Ok(())
+                }
+                AppEvent::UpdateDownloaded(result) => {
+                    update_status = match result {
+                        Ok(update) => {
+                            staged_update = Some(update);
+                            "downloaded"
+                        }
+                        Err(_) => "download_error",
+                    };
+                    Ok(())
+                }
                 AppEvent::FfmpegInstalled(result) => (|| -> Result<()> {
                     let cancelled = downloading.take().is_some_and(|stop| stop.load(Ordering::Relaxed));
                     if !quitting && !cancelled {
@@ -650,6 +720,7 @@ fn run() -> Result<()> {
                             send_preferences(&settings);
                             send_settings(&settings, &displays, shortcut);
                             audio_devices(&proxy);
+                            ipc(&view, "applications", &applications::running());
                             if awaiting_ffmpeg {
                                 ipc(&view, "ffmpegPrompt", &true);
                             }
@@ -661,12 +732,16 @@ fn run() -> Result<()> {
                             }
                         }
                         Request::Preferences { preferences } => {
+                            let enable_updates = preferences.auto_update && !settings.preferences.auto_update;
                             let result = save_preferences(&directory, &mut settings, preferences);
                             send_preferences(&settings);
                             if result.is_err() {
                                 ipc(&view, "preferencesSaveError", &true);
                             }
                             result?;
+                            if enable_updates {
+                                next_update_check = Instant::now();
+                            }
                             ipc(&view, "preferencesSaved", &true);
                         }
                         Request::CloseChoice { behavior, remember } => {
@@ -689,6 +764,7 @@ fn run() -> Result<()> {
                                 } else {
                                     recorder.error = None;
                                     awaiting_ffmpeg = true;
+                                    show(&view);
                                     ipc(&view, "ffmpegPrompt", &true);
                                 }
                             }
@@ -750,6 +826,41 @@ fn run() -> Result<()> {
                             ipc(&view, "applied", &true);
                         }
                         Request::RefreshDevices => audio_devices(&proxy),
+                        Request::RefreshApplications => ipc(&view, "applications", &applications::running()),
+                        Request::CheckUpdate => {
+                            if !matches!(update_status, "checking" | "downloading" | "downloaded") {
+                                update_status = "checking";
+                                available_update = None;
+                                next_update_check = Instant::now() + Duration::from_secs(12 * 60 * 60);
+                                let proxy = proxy.clone();
+                                std::thread::spawn(move || {
+                                    let _ = proxy.send(AppEvent::UpdateChecked(updater::check()));
+                                });
+                            }
+                        }
+                        Request::DownloadUpdate => {
+                            if matches!(update_status, "available" | "download_error")
+                                && let Some(update) = &available_update
+                            {
+                                update_status = "downloading";
+                                let update = update.clone();
+                                let proxy = proxy.clone();
+                                std::thread::spawn(move || {
+                                    let _ = proxy.send(AppEvent::UpdateDownloaded(updater::download(&update)));
+                                });
+                            }
+                        }
+                        Request::InstallUpdate => {
+                            if recorder.can_configure() && downloading.is_none() && !awaiting_ffmpeg
+                                && let Some(update) = staged_update.take()
+                            {
+                                if update.install().is_ok() {
+                                    quitting = true;
+                                } else {
+                                    update_status = "download_error";
+                                }
+                            }
+                        }
                         Request::OpenFolder => {
                             fs::create_dir_all(&settings.output)?;
                             launch(settings.output.as_os_str())?;
@@ -763,6 +874,13 @@ fn run() -> Result<()> {
                 AppEvent::Tick => Ok(()),
             };
             if due {
+                if ready && !quitting && settings.preferences.auto_update
+                    && !matches!(update_status, "checking" | "downloading" | "downloaded")
+                    && Instant::now() >= next_update_check
+                {
+                    next_update_check = Instant::now() + Duration::from_secs(12 * 60 * 60);
+                    let _ = proxy.send(AppEvent::Request(Request::CheckUpdate));
+                }
                 if let Some(overlay) = &mut overlay {
                     overlay.tick(Instant::now());
                 }
@@ -808,9 +926,23 @@ fn run() -> Result<()> {
             status.error = local_error.as_deref();
             if ready {
                 ipc(&view, "status", &status);
+                if new_frontend || update_status != update_before {
+                    ipc(&view, "updateState", &json!({
+                        "state": update_status,
+                        "version": available_update.as_ref().map(|update| &update.version),
+                    }));
+                }
             }
             if let Some(panel) = &mut tray_panel {
                 panel.update(&status, status.limit.unwrap_or(settings.seconds), shortcut.then_some(settings.shortcut), locale);
+            }
+            if let Some(toggle) = &fallback_toggle {
+                let (label, enabled) = tray_panel::buffer_control(status.phase, status.saving);
+                if fallback_state != Some((label, enabled, locale)) {
+                    let _ = toggle.set_text(locale.text(label));
+                    let _ = toggle.set_enabled(enabled);
+                    fallback_state = Some((label, enabled, locale));
+                }
             }
             if quitting && !status.saving && downloading.is_none() {
                 unregister_shortcut(hwnd, settings.shortcut);

@@ -138,8 +138,8 @@
           </fieldset>
         </article>
         <article class="panel controls routing">
-          <div class="panel-heading"><h2>Маршрутизация</h2><button type="button" class="pill" id="add-track"><span data-icon="plus"></span>Дорожка</button></div>
-          <p class="hint">Отметьте оба источника, чтобы получить микс. Первая активная дорожка воспроизводится по умолчанию.</p>
+          <div class="panel-heading"><h2>Маршрутизация</h2><div class="routing-actions"><button type="button" class="pill" id="refresh-apps" data-action="refresh_applications">Обновить список приложений</button><button type="button" class="pill" id="add-track"><span data-icon="plus"></span>Дорожка</button></div></div>
+          <p class="hint">До 10 дорожек. Выберите приложение или включите системный звук, микрофон либо оба источника. Первая активная дорожка воспроизводится по умолчанию.</p>
           <fieldset class="editable" id="tracks"></fieldset>
         </article>
         <div class="edit-footer">
@@ -159,14 +159,23 @@
               <p class="hint" id="startup-hint">При входе в Windows буфер включится снова, если он был активен.</p>
             </div>
           </div>
-          <div class="preferences-status">
-            <div class="preferences-meta">
-              <span id="app-version"></span>
-              <button type="button" class="pill repository" data-action="open_repository" aria-label="Репозиторий Rewind на GitHub">GitHub <span aria-hidden="true">↗</span></button>
-            </div>
-            <output id="preferences-feedback" role="status"></output>
-          </div>
+          <output id="preferences-feedback" class="preferences-status" role="status"></output>
         </div>
+        <section class="panel controls update-setting" aria-labelledby="updates-heading">
+          <div class="update-summary">
+            <div class="update-heading"><h2 id="updates-heading">Обновления</h2><span id="app-version"></span></div>
+            <output id="update-status" class="hint" role="status" hidden></output>
+          </div>
+          <div class="update-actions">
+            <button type="button" class="pill" id="check-update" data-action="check_update">Проверить обновления</button>
+            <button type="button" class="pill primary" id="show-update" hidden>Скачать…</button>
+            <button type="button" class="pill primary" id="install-update" data-action="install_update" hidden>Установить и перезапустить</button>
+          </div>
+          <div class="update-footer">
+            <label><input class="switch" type="checkbox" name="auto_update" checked>Автоматически проверять обновления</label>
+            <button type="button" class="pill repository" data-action="open_repository" aria-label="Репозиторий Rewind на GitHub">GitHub <span aria-hidden="true">↗</span></button>
+          </div>
+        </section>
       </section>
     </main>
   </div>
@@ -191,6 +200,16 @@
       <div class="prompt-actions">
         <button type="submit" class="pill" value="exit">Выйти</button>
         <button type="submit" class="pill" value="path" autofocus>Указать путь</button>
+        <button type="submit" class="pill primary" value="download">Скачать</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="update-prompt" class="prompt" aria-labelledby="update-title" aria-describedby="update-description">
+    <form method="dialog">
+      <h2 id="update-title">Доступно обновление</h2>
+      <p class="hint prompt-description" id="update-description"><span>Новая версия Rewind</span> <strong id="update-version"></strong><br>После загрузки установку можно запустить из настроек.</p>
+      <div class="prompt-actions">
+        <button type="submit" class="pill" value="later" autofocus>Позже</button>
         <button type="submit" class="pill primary" value="download">Скачать</button>
       </div>
     </form>
