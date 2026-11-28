@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc,
-    atomic::{AtomicU16, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
     mpsc::{self, Receiver, TryRecvError},
 };
 use std::thread;
@@ -49,7 +49,14 @@ pub struct Display {
 #[derive(Clone)]
 enum VideoInput {
     Synthetic,
-    Dxgi { adapter: Option<u32>, output: u32 },
+    Wgc {
+        adapter: Option<u32>,
+        monitor: usize,
+    },
+    Dxgi {
+        adapter: Option<u32>,
+        output: u32,
+    },
     Gdi(Display),
 }
 
@@ -58,7 +65,7 @@ struct CapturePlan {
     encoder: Encoder,
 }
 
-fn dxgi_output(display: &Display) -> Option<(VideoInput, Option<Encoder>)> {
+fn dxgi_output(display: &Display) -> Option<(u32, u32, Option<Encoder>)> {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1().ok()? };
     for index in 0.. {
         let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else {
@@ -79,13 +86,7 @@ fn dxgi_output(display: &Display) -> Option<(VideoInput, Option<Encoder>)> {
                         0x8086 => Some(Encoder::Intel),
                         _ => None,
                     });
-                return Some((
-                    VideoInput::Dxgi {
-                        adapter: Some(index),
-                        output,
-                    },
-                    encoder,
-                ));
+                return Some((index, output, encoder));
             }
         }
     }
@@ -114,12 +115,33 @@ fn capture_plans(
     let display = displays
         .get(settings.display)
         .context("Выбранный монитор отключён")?;
+    let output = dxgi_output(display);
+    let wgc = VideoInput::Wgc {
+        adapter: output.map(|(adapter, _, _)| adapter),
+        monitor: display.handle,
+    };
     let gdi = VideoInput::Gdi(display.clone());
     if !settings.automatic_capture {
-        return Ok([plan(gdi, settings.encoder)].into());
+        let input = if matches!(settings.mode, CaptureMode::Wgc) {
+            wgc
+        } else {
+            gdi
+        };
+        return Ok([plan(input, settings.encoder)].into());
     }
     let mut plans = VecDeque::new();
-    if let Some((dxgi, hardware)) = dxgi_output(display) {
+    if settings.cursor {
+        // Windows composites the pointer for WGC, including custom cursors with alpha.
+        if let Some((_, _, Some(encoder))) = output {
+            plans.push_back(plan(wgc.clone(), encoder));
+        }
+        plans.push_back(plan(wgc, Encoder::Cpu));
+    }
+    if let Some((adapter, output, hardware)) = output {
+        let dxgi = VideoInput::Dxgi {
+            adapter: Some(adapter),
+            output,
+        };
         if let Some(encoder) = hardware {
             plans.push_back(plan(dxgi.clone(), encoder));
         }
@@ -257,9 +279,14 @@ struct CaptureProgress {
 }
 
 impl Session {
-    fn start(root: &Path, settings: &Settings, plan: CapturePlan) -> Result<Self> {
+    fn start(
+        root: &Path,
+        settings: &Settings,
+        plan: CapturePlan,
+        microphone_muted: Arc<AtomicBool>,
+    ) -> Result<Self> {
         let synthetic = matches!(plan.input, VideoInput::Synthetic);
-        let direct = matches!(plan.input, VideoInput::Dxgi { .. })
+        let direct = matches!(plan.input, VideoInput::Dxgi { .. } | VideoInput::Wgc { .. })
             && plan.encoder == Encoder::Nvidia
             && settings.native_resolution;
         let directory = Builder::new().prefix("buffer-").tempdir_in(root)?;
@@ -270,6 +297,7 @@ impl Session {
                 .timestamp_nanos_opt()
                 .unwrap_or_default()
                 .to_string(),
+            microphone_muted,
         )?;
         let mut cmd = command(&settings.ffmpeg);
         cmd.current_dir(directory.path())
@@ -299,6 +327,31 @@ impl Session {
             )
         };
         let software_video = format!("{size_filter},setsar=1");
+        if let VideoInput::Dxgi {
+            adapter: Some(adapter),
+            ..
+        }
+        | VideoInput::Wgc {
+            adapter: Some(adapter),
+            ..
+        } = &plan.input
+        {
+            cmd.args([
+                "-init_hw_device",
+                &format!("d3d11va=screen:{adapter}"),
+                "-filter_hw_device",
+                "screen",
+            ]);
+        }
+        let mut hardware_input = |filter: String, mode| {
+            let filter = if direct {
+                format!("{filter}[v]")
+            } else {
+                format!("{filter},hwdownload,format=bgra,{software_video}[v]")
+            };
+            cmd.args(["-filter_complex", &filter]);
+            Some(mode)
+        };
         let mode = match plan.input {
             VideoInput::Synthetic => {
                 cmd.args([
@@ -313,30 +366,22 @@ impl Session {
                 ]);
                 None
             }
-            VideoInput::Dxgi { adapter, output } => {
-                if let Some(adapter) = adapter {
-                    cmd.args([
-                        "-init_hw_device",
-                        &format!("d3d11va=screen:{adapter}"),
-                        "-filter_hw_device",
-                        "screen",
-                    ]);
-                }
-                let filters = if direct {
-                    String::new()
-                } else {
-                    format!(",hwdownload,format=bgra,{software_video}")
-                };
-                cmd.args([
-                    "-filter_complex",
-                    &format!(
-                        "ddagrab=output_idx={output}:framerate={}:draw_mouse={}{filters}[v]",
-                        settings.fps,
-                        u8::from(settings.cursor)
-                    ),
-                ]);
-                Some(CaptureMode::Dxgi)
-            }
+            VideoInput::Wgc { monitor, .. } => hardware_input(
+                format!(
+                    "gfxcapture=hmonitor={monitor}:max_framerate={}:capture_cursor={}",
+                    settings.fps,
+                    u8::from(settings.cursor)
+                ),
+                CaptureMode::Wgc,
+            ),
+            VideoInput::Dxgi { output, .. } => hardware_input(
+                format!(
+                    "ddagrab=output_idx={output}:framerate={}:draw_mouse={}",
+                    settings.fps,
+                    u8::from(settings.cursor)
+                ),
+                CaptureMode::Dxgi,
+            ),
             VideoInput::Gdi(display) => {
                 cmd.args([
                     "-f",
@@ -357,7 +402,7 @@ impl Session {
                 Some(CaptureMode::Gdi)
             }
         };
-        let dxgi = matches!(mode, Some(CaptureMode::Dxgi));
+        let filter_input = matches!(mode, Some(CaptureMode::Dxgi | CaptureMode::Wgc));
         if let Some(feed) = &audio {
             let apps = settings.applications();
             let layout = if apps.is_empty() {
@@ -382,7 +427,7 @@ impl Session {
                 &feed.name,
             ]);
             let track_count = settings.active_tracks().count();
-            let audio_source = if dxgi { "[0:a:0]" } else { "[1:a:0]" };
+            let audio_source = if filter_input { "[0:a:0]" } else { "[1:a:0]" };
             let mut filter = String::new();
             if track_count > 1 {
                 let outputs = (0..track_count)
@@ -418,12 +463,12 @@ impl Session {
         }
         cmd.args([
             "-map",
-            if dxgi { "[v]" } else { "0:v:0" },
+            if filter_input { "[v]" } else { "0:v:0" },
             "-fps_mode:v",
             "vfr",
         ]);
         if !direct {
-            if !dxgi {
+            if !filter_input {
                 cmd.args(["-vf", &software_video]);
             }
             cmd.args([
@@ -930,6 +975,7 @@ pub struct Recorder {
     plans: VecDeque<CapturePlan>,
     saving: Option<(Option<u32>, Instant, ExportCodec)>,
     cycle: u32,
+    microphone_muted: Arc<AtomicBool>,
     pub last: Option<PathBuf>,
     pub error: Option<String>,
 }
@@ -946,6 +992,7 @@ pub struct Status<'a> {
     pub capture_mode: Option<CaptureMode>,
     pub limit: Option<u32>,
     pub saving: bool,
+    pub microphone_muted: bool,
     pub last: Option<&'a Path>,
     pub error: Option<&'a str>,
 }
@@ -954,10 +1001,11 @@ fn next_session(
     directory: &Path,
     settings: &Settings,
     plans: &mut VecDeque<CapturePlan>,
+    microphone_muted: &Arc<AtomicBool>,
 ) -> Result<Session> {
     let mut error = anyhow::anyhow!("Не найден доступный способ захвата.");
     while let Some(plan) = plans.pop_front() {
-        match Session::start(directory, settings, plan) {
+        match Session::start(directory, settings, plan, Arc::clone(microphone_muted)) {
             Ok(session) => return Ok(session),
             Err(cause) => error = cause,
         }
@@ -999,7 +1047,12 @@ impl Recorder {
         settings.validate()?;
         self.error = None;
         self.plans = capture_plans(settings, displays, synthetic)?;
-        self.session = Some(next_session(directory, settings, &mut self.plans)?);
+        self.session = Some(next_session(
+            directory,
+            settings,
+            &mut self.plans,
+            &self.microphone_muted,
+        )?);
         self.cycle = self.cycle.wrapping_add(1);
         Ok(())
     }
@@ -1010,6 +1063,10 @@ impl Recorder {
             session.stop()?;
         }
         Ok(())
+    }
+
+    pub fn toggle_microphone(&self) {
+        self.microphone_muted.fetch_xor(true, Ordering::Relaxed);
     }
 
     pub fn can_configure(&self) -> bool {
@@ -1061,7 +1118,12 @@ impl Recorder {
                     && session.stop_at.is_none()
                     && !self.plans.is_empty();
                 if fallback && let Some(root) = session.directory.path().parent() {
-                    match next_session(root, &session.settings, &mut self.plans) {
+                    match next_session(
+                        root,
+                        &session.settings,
+                        &mut self.plans,
+                        &self.microphone_muted,
+                    ) {
                         Ok(next) => {
                             self.session = Some(next);
                             self.error = None;
@@ -1106,6 +1168,7 @@ impl Recorder {
     }
 
     pub fn status(&self) -> Status<'_> {
+        let microphone_muted = self.microphone_muted.load(Ordering::Relaxed);
         let Some(session) = &self.session else {
             return Status {
                 phase: "idle",
@@ -1118,6 +1181,7 @@ impl Recorder {
                 capture_mode: None,
                 limit: None,
                 saving: false,
+                microphone_muted,
                 last: self.last.as_deref(),
                 error: self.error.as_deref(),
             };
@@ -1160,6 +1224,7 @@ impl Recorder {
             capture_mode: session.mode,
             limit: Some(session.settings.seconds),
             saving: self.export.is_some() || self.saving.is_some(),
+            microphone_muted,
             last: self.last.as_deref(),
             error: self.error.as_deref(),
         }

@@ -1,5 +1,7 @@
 import { localize, t } from "./i18n.js";
 import { downloadLabel } from "./ffmpeg-progress.js";
+import { renderMicrophone } from "./microphone.js";
+import { setupTooltips } from "./tooltips.js";
 
 localize("ru");
 
@@ -13,8 +15,9 @@ const text = (selector, value) => {
 };
 
 window.rewind = {
-  status({ phase, seconds, limit, saving, shortcut, locale, toggle_label, toggle_enabled, download }) {
+  status({ phase, seconds, limit, saving, microphone_muted, shortcut, locale, toggle_label, toggle_enabled, download }) {
     localize(locale);
+    renderMicrophone(microphone_muted);
     document.body.dataset.phase = phase;
     text("#record-state", phase === "downloading" ? downloadLabel(download) : t({
       idle: seconds ? "Запись остановлена" : "Буфер выключен",
@@ -55,3 +58,4 @@ document.addEventListener("keydown", (event) => {
   }
 });
 send("ready");
+setupTooltips();

@@ -9,16 +9,19 @@ mod localization;
 mod overlay;
 mod path_picker;
 mod recorder;
+mod release_notes;
 mod settings;
 mod startup;
 mod tray_panel;
 mod updater;
 mod window_events;
 
+use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -27,7 +30,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
-use control_panel::{ControlPanel, QuickSettings};
+use control_panel::{ControlPanel, OverlayWindow, QuickSettings};
 use localization::Locale;
 use overlay::{Notice, Overlay};
 use recorder::{Display, Recorder, SaveOutcome, recording_error_text};
@@ -71,6 +74,7 @@ enum Request {
     },
     Stop,
     Save,
+    ToggleMicrophone,
     Apply {
         settings: Box<Settings>,
     },
@@ -79,6 +83,7 @@ enum Request {
     CheckUpdate,
     DownloadUpdate,
     InstallUpdate,
+    ReadReleaseNotes,
     OpenFolder,
     OpenClip,
     OpenOverlay,
@@ -113,6 +118,7 @@ enum AppEvent {
     Request(Request),
     Hotkey,
     Devices(Result<[Vec<audio::Device>; 2]>),
+    Applications(Vec<applications::Application>),
     UpdateChecked(Result<Option<updater::Update>>),
     UpdateProgress(updater::Progress),
     UpdateDownloaded(Result<updater::Download>),
@@ -124,11 +130,29 @@ enum AppEvent {
     DismissTray,
     ControlPanel,
     OverlayHotkey,
+    OverlayToggled(Result<()>),
     ControlReady,
     DismissControl,
     QuickSettings(QuickSettings),
     Show,
     Quit,
+}
+
+type EventPump = Box<dyn FnMut()>;
+
+thread_local! {
+    static EVENT_PUMP: RefCell<Option<EventPump>> = const { RefCell::new(None) };
+}
+
+fn process_events() {
+    EVENT_PUMP.with(|slot| {
+        // A native window call can dispatch another message before this pump returns.
+        if let Ok(mut slot) = slot.try_borrow_mut()
+            && let Some(pump) = slot.as_mut()
+        {
+            pump();
+        }
+    });
 }
 
 #[derive(Serialize)]
@@ -144,6 +168,7 @@ enum ControlAction {
     Ready,
     Dismiss,
     ToggleBuffer,
+    ToggleMicrophone,
     Save,
     Apply { settings: QuickSettings },
 }
@@ -154,29 +179,22 @@ fn ipc(view: &WebviewWindow, name: &str, value: &impl serde::Serialize) {
     }
 }
 
+fn local_page(url: &tauri::Url, paths: &[&str]) -> bool {
+    url.scheme() == "http"
+        && url.host_str() == Some("tauri.localhost")
+        && url.port().is_none()
+        && paths.contains(&url.path())
+}
+
 #[tauri::command]
-fn dispatch(
-    window: WebviewWindow,
-    events: State<'_, Sender<AppEvent>>,
-    request: Request,
-) -> Result<(), String> {
-    if window.label() != "main" {
-        return Err("Команда доступна в главном окне.".into());
-    }
+fn dispatch(events: State<'_, Sender<AppEvent>>, request: Request) -> Result<(), String> {
     events
         .send(AppEvent::Request(request))
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn tray_action(
-    window: WebviewWindow,
-    events: State<'_, Sender<AppEvent>>,
-    action: String,
-) -> Result<(), String> {
-    if window.label() != "tray" {
-        return Err("Команда доступна в меню Rewind.".into());
-    }
+fn tray_action(events: State<'_, Sender<AppEvent>>, action: String) -> Result<(), String> {
     let event = match action.as_str() {
         "ready" => AppEvent::TrayReady,
         "dismiss" => AppEvent::DismissTray,
@@ -184,6 +202,7 @@ fn tray_action(
         "overlay" => AppEvent::ControlPanel,
         "save" => AppEvent::Hotkey,
         "toggle_buffer" => AppEvent::ToggleBuffer,
+        "toggle_microphone" => AppEvent::Request(Request::ToggleMicrophone),
         "quit" => AppEvent::Quit,
         _ => return Err("Неизвестная команда меню.".into()),
     };
@@ -192,17 +211,14 @@ fn tray_action(
 
 #[tauri::command]
 fn control_action(
-    window: WebviewWindow,
     events: State<'_, Sender<AppEvent>>,
     request: ControlAction,
 ) -> Result<(), String> {
-    if window.label() != control_panel::LABEL {
-        return Err("Команда доступна в оверлее Rewind.".into());
-    }
     let event = match request {
         ControlAction::Ready => AppEvent::ControlReady,
         ControlAction::Dismiss => AppEvent::DismissControl,
         ControlAction::ToggleBuffer => AppEvent::ToggleBuffer,
+        ControlAction::ToggleMicrophone => AppEvent::Request(Request::ToggleMicrophone),
         ControlAction::Save => AppEvent::Request(Request::Save),
         ControlAction::Apply { settings } => AppEvent::QuickSettings(settings),
     };
@@ -213,6 +229,16 @@ fn audio_devices(proxy: &Sender<AppEvent>) {
     let proxy = proxy.clone();
     std::thread::spawn(move || {
         let _ = proxy.send(AppEvent::Devices(audio::devices()));
+    });
+}
+
+fn refresh_applications(proxy: &Sender<AppEvent>, pending: &mut bool) {
+    if std::mem::replace(pending, true) {
+        return;
+    }
+    let proxy = proxy.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = proxy.send(AppEvent::Applications(applications::running()));
     });
 }
 
@@ -455,6 +481,14 @@ fn run() -> Result<()> {
     if windows_startup && !settings.preferences.start_with_windows {
         return Ok(());
     }
+    let release_history = release_notes::history();
+    let mut unread_release = release_history
+        .iter()
+        .any(|release| release.version == release_notes::CURRENT)
+        && release_notes::unread(&directory).unwrap_or_else(|error| {
+            eprintln!("Не удалось прочитать состояние истории версий: {error:#}");
+            false
+        });
     let buffers = open_buffers(&directory)?;
     let mut recorder = Recorder::default();
     recorder.last = last_clip(&settings.output);
@@ -479,16 +513,39 @@ fn run() -> Result<()> {
         .decorations(false)
         .background_color(Color(0, 0, 0, 255))
         .data_directory(webview_data.clone())
-        .on_navigation(|url| {
-            url.host_str() == Some("tauri.localhost") && matches!(url.path(), "/" | "/index.html")
-        })
+        .on_navigation(|url| local_page(url, &["/", "/index.html"]))
         .on_new_window(|_, _| NewWindowResponse::Deny)
         .build()
         .context(
             "Не удалось открыть интерфейс Rewind. Проверьте, установлен ли Microsoft Edge WebView2",
         )?;
     let hwnd = view.hwnd()?;
-    let window_events = window_events::WindowEvents::attach(hwnd, proxy.clone())?;
+    let overlay_window = Rc::new(OverlayWindow::default());
+    let mut control = ControlPanel::new(
+        app.handle(),
+        webview_data.clone(),
+        Rc::clone(&overlay_window),
+    )
+    .inspect_err(|error| eprintln!("Не удалось подготовить оверлей Rewind: {error:#}"))
+    .ok();
+    let suspend_overlay_hotkey = Rc::new(Cell::new(false));
+    let window_events = window_events::WindowEvents::attach(hwnd, {
+        let proxy = proxy.clone();
+        let overlay_window = Rc::clone(&overlay_window);
+        let suspended = Rc::clone(&suspend_overlay_hotkey);
+        move |event| {
+            // Use the foreground permission that Windows grants during WM_HOTKEY.
+            let event = if matches!(event, AppEvent::OverlayHotkey)
+                && !suspended.get()
+                && overlay_window.available()
+            {
+                AppEvent::OverlayToggled(overlay_window.toggle())
+            } else {
+                event
+            };
+            let _ = proxy.send(event);
+        }
+    })?;
     let mut shortcut = register_shortcut(hwnd, settings.shortcut);
     let mut overlay_hotkey = control_panel::register(
         hwnd,
@@ -580,18 +637,26 @@ fn run() -> Result<()> {
             true,
             None::<&str>,
         )?;
+        let microphone = MenuItem::with_id(
+            &app,
+            "toggle_microphone",
+            locale.text("Заглушить микрофон"),
+            true,
+            None::<&str>,
+        )?;
         let menu = Menu::with_items(
             &app,
             &[
                 &open,
                 &toggle,
                 &save,
+                &microphone,
                 &overlay_item,
                 &PredefinedMenuItem::separator(&app)?,
                 &quit,
             ],
         )?;
-        fallback_toggle = Some(toggle);
+        fallback_toggle = Some((toggle, microphone));
         let menu_proxy = proxy.clone();
         tray_builder = tray_builder.menu(&menu).on_menu_event(move |_, event| {
             let event = match event.id().as_ref() {
@@ -599,6 +664,7 @@ fn run() -> Result<()> {
                 "overlay" => AppEvent::ControlPanel,
                 "save" => AppEvent::Hotkey,
                 "toggle_buffer" => AppEvent::ToggleBuffer,
+                "toggle_microphone" => AppEvent::Request(Request::ToggleMicrophone),
                 "quit" => AppEvent::Quit,
                 _ => return,
             };
@@ -612,22 +678,33 @@ fn run() -> Result<()> {
     std::thread::Builder::new()
         .name("rewind-clock".into())
         .spawn(move || {
+            let pending = Arc::new(AtomicBool::new(false));
             while let Err(mpsc::RecvTimeoutError::Timeout) =
                 stop_ticks.recv_timeout(Duration::from_millis(180))
             {
-                // Wake the Tauri loop even when both WebViews are hidden.
-                if tick_proxy.send(AppEvent::Tick).is_err()
-                    || tick_handle.run_on_main_thread(|| {}).is_err()
+                if pending.swap(true, Ordering::Relaxed) {
+                    continue;
+                }
+                let pending = Arc::clone(&pending);
+                let events = tick_proxy.clone();
+                // Run the tick directly. A wake-up alone still waits for Tauri's next paint cycle.
+                if tick_handle
+                    .run_on_main_thread(move || {
+                        let _ = events.send(AppEvent::Tick);
+                        process_events();
+                        pending.store(false, Ordering::Relaxed);
+                    })
+                    .is_err()
                 {
                     break;
                 }
             }
         })?;
     let mut ready = false;
+    let mut refreshing_applications = false;
     let mut close_pending = false;
     let mut quitting = false;
     let mut overlay = Overlay::new().ok();
-    let mut control: Option<ControlPanel> = None;
     let mut awaiting_ffmpeg = false;
     let mut downloading: Option<Arc<AtomicBool>> = None;
     let mut ffmpeg_progress = None;
@@ -641,38 +718,47 @@ fn run() -> Result<()> {
     let mut staged_update: Option<updater::Download> = None;
     let mut next_update_check = Instant::now();
     let mut fallback_state = None;
-    app.run_return(move |app, event| {
-        let _ = (&lock, &window_events, &keep_ticking);
-        let start_capture = |recorder: &mut Recorder, displays: &mut Vec<Display>, settings: &Settings| {
-            *displays = monitors();
-            recorder.start(&buffers, settings, displays, false)
-        };
-        if let RunEvent::WindowEvent { label, event: WindowEvent::CloseRequested { api, .. }, .. } = event {
-            api.prevent_close();
-            let event = match label.as_str() {
-                "tray" => AppEvent::DismissTray,
-                control_panel::LABEL => AppEvent::DismissControl,
-                _ => AppEvent::CloseMain,
+    let app_handle = app.handle().clone();
+    let close_proxy = proxy.clone();
+    let pump = Box::new(move || {
+        let app = &app_handle;
+        let start_capture =
+            |recorder: &mut Recorder, displays: &mut Vec<Display>, settings: &Settings| {
+                *displays = monitors();
+                recorder.start(&buffers, settings, displays, false)
             };
-            let _ = proxy.send(event);
-        }
         for event in incoming.try_iter() {
             let locale = settings.preferences.language.resolve();
             let send_preferences = |settings: &Settings| {
                 let _ = view.set_zoom(f64::from(settings.preferences.interface_scale) / 100.0);
-                ipc(&view, "preferences", &json!({
-                    "preferences": settings.preferences,
-                    "locale": settings.preferences.language.resolve(),
-                    "tray": tray.is_some(),
-                    "version": env!("CARGO_PKG_VERSION")
-                }));
+                ipc(
+                    &view,
+                    "preferences",
+                    &json!({
+                        "preferences": settings.preferences,
+                        "locale": settings.preferences.language.resolve(),
+                        "tray": tray.is_some(),
+                        "version": env!("CARGO_PKG_VERSION")
+                    }),
+                );
             };
             let send_settings = |settings: &Settings, displays: &[Display], shortcut: bool| {
                 let detected_ffmpeg = ffmpeg::find(&settings.ffmpeg, &directory);
-                ipc(&view, "configure", &json!({"settings": settings, "displays": displays, "shortcut": shortcut, "tray": tray.is_some(), "detected_ffmpeg": detected_ffmpeg}));
+                ipc(
+                    &view,
+                    "configure",
+                    &json!({"settings": settings, "displays": displays, "shortcut": shortcut, "tray": tray.is_some(), "detected_ffmpeg": detected_ffmpeg}),
+                );
             };
-            if matches!(&event, AppEvent::Show | AppEvent::Hotkey | AppEvent::Quit | AppEvent::ControlPanel | AppEvent::OverlayHotkey)
-                && let Some(panel) = &mut tray_panel
+            if matches!(
+                &event,
+                AppEvent::Show
+                    | AppEvent::Hotkey
+                    | AppEvent::Quit
+                    | AppEvent::ControlPanel
+                    | AppEvent::OverlayHotkey
+                    | AppEvent::OverlayToggled(_)
+            ) && let Some(panel) = &mut tray_panel
             {
                 panel.hide();
             }
@@ -681,13 +767,20 @@ fn run() -> Result<()> {
             let update_before = (update_status, update_progress);
             let capture_action = matches!(
                 &event,
-                AppEvent::Request(Request::Start | Request::Stop | Request::FfmpegChoice { choice: FfmpegChoice::Download | FfmpegChoice::Path { .. } })
-                    | AppEvent::FfmpegInstalled(_)
+                AppEvent::Request(
+                    Request::Start
+                        | Request::Stop
+                        | Request::FfmpegChoice {
+                            choice: FfmpegChoice::Download | FfmpegChoice::Path { .. }
+                        }
+                ) | AppEvent::FfmpegInstalled(_)
             );
             let result = match event {
                 AppEvent::TrayMenu(position) => {
                     if let Some(panel) = &mut tray_panel {
-                        panel.open(position).context("Не удалось открыть меню Rewind")
+                        panel
+                            .open(position)
+                            .context("Не удалось открыть меню Rewind")
                     } else {
                         Ok(())
                     }
@@ -706,48 +799,81 @@ fn run() -> Result<()> {
                 }
                 AppEvent::OverlayHotkey if capturing_overlay_shortcut => {
                     capturing_overlay_shortcut = false;
-                    ipc(&view, "overlayShortcut", &json!({ "shortcut": settings.preferences.overlay_shortcut, "registered": overlay_hotkey.is_some() }));
+                    ipc(
+                        &view,
+                        "overlayShortcut",
+                        &json!({ "shortcut": settings.preferences.overlay_shortcut, "registered": overlay_hotkey.is_some() }),
+                    );
                     Ok(())
                 }
                 AppEvent::Hotkey if capturing_overlay_shortcut => {
                     capturing_overlay_shortcut = false;
-                    ipc(&view, "overlayShortcut", &json!({ "shortcut": settings.preferences.overlay_shortcut, "registered": overlay_hotkey.is_some(), "error": locale.text("Это сочетание уже сохраняет повтор.") }));
+                    ipc(
+                        &view,
+                        "overlayShortcut",
+                        &json!({ "shortcut": settings.preferences.overlay_shortcut, "registered": overlay_hotkey.is_some(), "error": locale.text("Это сочетание уже сохраняет повтор.") }),
+                    );
                     Ok(())
                 }
                 AppEvent::ControlPanel | AppEvent::OverlayHotkey => (|| -> Result<()> {
                     if !quitting {
                         if control.is_none() {
-                            control = Some(ControlPanel::new(app, webview_data.clone())?);
+                            control = Some(ControlPanel::new(
+                                app,
+                                webview_data.clone(),
+                                Rc::clone(&overlay_window),
+                            )?);
                         }
-                        if let Some(panel) = &mut control {
-                            panel.toggle()?;
+                        if let Some(panel) = control.as_mut() {
+                            overlay_window.toggle()?;
+                            panel.finish_toggle();
                         }
                     }
                     Ok(())
                 })(),
+                AppEvent::OverlayToggled(result) => {
+                    if result.is_ok()
+                        && let Some(panel) = control.as_mut()
+                    {
+                        panel.finish_toggle();
+                    }
+                    result
+                }
                 AppEvent::ControlReady => {
-                    if let Some(panel) = &mut control { panel.refresh(); }
+                    if let Some(panel) = control.as_mut() {
+                        panel.refresh();
+                        panel.focus_webview();
+                    }
                     Ok(())
                 }
                 AppEvent::DismissControl => {
-                    if let Some(panel) = &mut control { panel.hide(); }
+                    if let Some(panel) = control.as_mut() {
+                        panel.hide();
+                    }
                     Ok(())
                 }
                 AppEvent::QuickSettings(quick) => {
                     let update = (|| -> Result<()> {
-                        ensure!(!quitting && downloading.is_none() && !awaiting_ffmpeg && recorder.can_configure(), "Остановите запись и дождитесь завершения текущей операции.");
+                        ensure!(
+                            !quitting
+                                && downloading.is_none()
+                                && !awaiting_ffmpeg
+                                && recorder.can_configure(),
+                            "Остановите запись и дождитесь завершения текущей операции."
+                        );
                         let mut next = settings.clone();
                         next.seconds = quick.seconds;
                         next.fps = quick.fps;
                         next.export_codec = quick.export_codec;
                         next.validate()?;
-                        next.write(&directory).context("Не удалось сохранить настройки")?;
+                        next.write(&directory)
+                            .context("Не удалось сохранить настройки")?;
                         settings = next;
                         recorder.error = None;
                         ipc(&view, "quickSettings", &quick);
                         Ok(())
                     })();
-                    if let Some(panel) = &control {
+                    if let Some(panel) = control.as_ref() {
                         let error = update.as_ref().err().map(|error| format!("{error:#}"));
                         let message = error.as_deref().map(|message| locale.text(message));
                         panel.applied(message.as_deref());
@@ -756,13 +882,23 @@ fn run() -> Result<()> {
                 }
                 AppEvent::ToggleBuffer => {
                     let status = recorder.status();
-                    let phase = if downloading.is_some() { "downloading" } else { status.phase };
+                    let phase = if downloading.is_some() {
+                        "downloading"
+                    } else {
+                        status.phase
+                    };
                     if !quitting && tray_panel::buffer_control(phase, status.saving).1 {
                         if awaiting_ffmpeg {
-                            if let Some(panel) = &mut control { panel.hide(); }
+                            if let Some(panel) = control.as_mut() {
+                                panel.hide();
+                            }
                             show(&view);
                         } else {
-                            let request = if phase == "idle" { Request::Start } else { Request::Stop };
+                            let request = if phase == "idle" {
+                                Request::Start
+                            } else {
+                                Request::Stop
+                            };
                             let _ = proxy.send(AppEvent::Request(request));
                         }
                     }
@@ -770,7 +906,9 @@ fn run() -> Result<()> {
                 }
                 AppEvent::CloseMain => {
                     let behavior = settings.preferences.close_behavior;
-                    if behavior == CloseBehavior::Ask || (behavior == CloseBehavior::Tray && tray.is_none()) {
+                    if behavior == CloseBehavior::Ask
+                        || (behavior == CloseBehavior::Tray && tray.is_none())
+                    {
                         if ready {
                             ipc(&view, "closePrompt", &tray.is_some());
                         } else {
@@ -786,15 +924,24 @@ fn run() -> Result<()> {
                     Ok(())
                 }
                 AppEvent::Show => {
-                    if let Some(panel) = &mut control { panel.hide(); }
+                    if let Some(panel) = control.as_mut() {
+                        panel.hide();
+                    }
                     show(&view);
                     Ok(())
                 }
                 AppEvent::Devices(devices) => {
                     match devices {
                         Ok(devices) => ipc(&view, "devices", &devices),
-                        Err(error) => ipc(&view, "deviceError", &locale.text(&format!("{error:#}"))),
+                        Err(error) => {
+                            ipc(&view, "deviceError", &locale.text(&format!("{error:#}")))
+                        }
                     }
+                    Ok(())
+                }
+                AppEvent::Applications(applications) => {
+                    refreshing_applications = false;
+                    ipc(&view, "applications", &applications);
                     Ok(())
                 }
                 AppEvent::UpdateChecked(result) => {
@@ -824,12 +971,16 @@ fn run() -> Result<()> {
                     Ok(())
                 }
                 AppEvent::FfmpegProgress(progress) => {
-                    if downloading.is_some() { ffmpeg_progress = Some(progress); }
+                    if downloading.is_some() {
+                        ffmpeg_progress = Some(progress);
+                    }
                     Ok(())
                 }
                 AppEvent::FfmpegInstalled(result) => (|| -> Result<()> {
                     ffmpeg_progress = None;
-                    let cancelled = downloading.take().is_some_and(|stop| stop.load(Ordering::Relaxed));
+                    let cancelled = downloading
+                        .take()
+                        .is_some_and(|stop| stop.load(Ordering::Relaxed));
                     if !quitting && !cancelled {
                         let path = result?;
                         ipc(&view, "detectedFfmpeg", &path);
@@ -846,9 +997,16 @@ fn run() -> Result<()> {
                         recorder.save(settings.export_codec)
                     };
                     match &result {
-                        Ok(true) => notify(&mut overlay, locale, Notice::Saving, &format!("Rewind · MP4 / {}", settings.export_codec.label())),
+                        Ok(true) => notify(
+                            &mut overlay,
+                            locale,
+                            Notice::Saving,
+                            &format!("Rewind · MP4 / {}", settings.export_codec.label()),
+                        ),
                         Ok(false) => {}
-                        Err(error) => notify(&mut overlay, locale, Notice::Failed, &error.to_string()),
+                        Err(error) => {
+                            notify(&mut overlay, locale, Notice::Failed, &error.to_string())
+                        }
                     }
                     result.map(|_| ())
                 }
@@ -856,11 +1014,23 @@ fn run() -> Result<()> {
                     match request {
                         Request::Ready => {
                             ready = true;
-                            ipc(&view, "overlayShortcut", &json!({"shortcut": settings.preferences.overlay_shortcut, "registered": overlay_hotkey.is_some()}));
+                            ipc(
+                                &view,
+                                "overlayShortcut",
+                                &json!({"shortcut": settings.preferences.overlay_shortcut, "registered": overlay_hotkey.is_some()}),
+                            );
                             send_preferences(&settings);
+                            ipc(
+                                &view,
+                                "releaseNotes",
+                                &json!({
+                                    "history": release_history,
+                                    "unread": unread_release.then_some(release_notes::CURRENT),
+                                }),
+                            );
                             send_settings(&settings, &displays, shortcut);
                             audio_devices(&proxy);
-                            ipc(&view, "applications", &applications::running());
+                            refresh_applications(&proxy, &mut refreshing_applications);
                             if awaiting_ffmpeg {
                                 ipc(&view, "ffmpegPrompt", &true);
                             }
@@ -873,7 +1043,8 @@ fn run() -> Result<()> {
                         }
                         Request::Preferences { mut preferences } => {
                             preferences.overlay_shortcut = settings.preferences.overlay_shortcut;
-                            let enable_updates = preferences.auto_update && !settings.preferences.auto_update;
+                            let enable_updates =
+                                preferences.auto_update && !settings.preferences.auto_update;
                             let result = save_preferences(&directory, &mut settings, preferences);
                             send_preferences(&settings);
                             if result.is_err() {
@@ -886,10 +1057,19 @@ fn run() -> Result<()> {
                             ipc(&view, "preferencesSaved", &true);
                         }
                         Request::CloseChoice { behavior, remember } => {
-                            ensure!(behavior != CloseBehavior::Ask, "Выберите, как закрыть Rewind.");
-                            ensure!(behavior != CloseBehavior::Tray || tray.is_some(), "Область уведомлений Windows недоступна.");
+                            ensure!(
+                                behavior != CloseBehavior::Ask,
+                                "Выберите, как закрыть Rewind."
+                            );
+                            ensure!(
+                                behavior != CloseBehavior::Tray || tray.is_some(),
+                                "Область уведомлений Windows недоступна."
+                            );
                             if remember {
-                                let preferences = Preferences { close_behavior: behavior, ..settings.preferences };
+                                let preferences = Preferences {
+                                    close_behavior: behavior,
+                                    ..settings.preferences
+                                };
                                 save_preferences(&directory, &mut settings, preferences)?;
                                 send_preferences(&settings);
                             }
@@ -897,7 +1077,10 @@ fn run() -> Result<()> {
                         }
                         Request::Start => {
                             if downloading.is_none() && !awaiting_ffmpeg && !quitting {
-                                ensure!(recorder.can_configure(), "Сначала остановите текущую запись.");
+                                ensure!(
+                                    recorder.can_configure(),
+                                    "Сначала остановите текущую запись."
+                                );
                                 let detected = ffmpeg::find(&settings.ffmpeg, &directory);
                                 ipc(&view, "detectedFfmpeg", &detected);
                                 if let Some(path) = detected {
@@ -907,7 +1090,9 @@ fn run() -> Result<()> {
                                 } else {
                                     recorder.error = None;
                                     awaiting_ffmpeg = true;
-                                    if let Some(panel) = &mut control { panel.hide(); }
+                                    if let Some(panel) = control.as_mut() {
+                                        panel.hide();
+                                    }
                                     show(&view);
                                     ipc(&view, "ffmpegPrompt", &true);
                                 }
@@ -919,25 +1104,42 @@ fn run() -> Result<()> {
                                     FfmpegChoice::Cancel => {}
                                     FfmpegChoice::Exit => quitting = true,
                                     FfmpegChoice::Download => {
-                                        ensure!(recorder.can_configure(), "Сначала дождитесь остановки записи или сохранения клипа.");
+                                        ensure!(
+                                            recorder.can_configure(),
+                                            "Сначала дождитесь остановки записи или сохранения клипа."
+                                        );
                                         let stop = Arc::new(AtomicBool::new(false));
                                         downloading = Some(Arc::clone(&stop));
-                                        ffmpeg_progress = Some(ffmpeg::Progress::Connecting { mirror: false });
+                                        ffmpeg_progress =
+                                            Some(ffmpeg::Progress::Connecting { mirror: false });
                                         let proxy = proxy.clone();
                                         let directory = directory.clone();
                                         std::thread::spawn(move || {
-                                            let result = ffmpeg::install(&directory, &stop, |progress| {
-                                                let _ = proxy.send(AppEvent::FfmpegProgress(progress));
-                                            });
+                                            let result =
+                                                ffmpeg::install(&directory, &stop, |progress| {
+                                                    let _ = proxy
+                                                        .send(AppEvent::FfmpegProgress(progress));
+                                                });
                                             let _ = proxy.send(AppEvent::FfmpegInstalled(result));
                                         });
                                     }
                                     FfmpegChoice::Path { path } => {
-                                        ensure!(recorder.can_configure(), "Сначала дождитесь остановки записи или сохранения клипа.");
-                                        ensure!(path.is_absolute() && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe")) && path.is_file(), "Укажите существующий файл ffmpeg.exe.");
+                                        ensure!(
+                                            recorder.can_configure(),
+                                            "Сначала дождитесь остановки записи или сохранения клипа."
+                                        );
+                                        ensure!(
+                                            path.is_absolute()
+                                                && path.extension().is_some_and(
+                                                    |ext| ext.eq_ignore_ascii_case("exe")
+                                                )
+                                                && path.is_file(),
+                                            "Укажите существующий файл ffmpeg.exe."
+                                        );
                                         let mut next = settings.clone();
                                         next.ffmpeg = path;
-                                        next.write(&directory).context("Не удалось сохранить настройки")?;
+                                        next.write(&directory)
+                                            .context("Не удалось сохранить настройки")?;
                                         settings.ffmpeg = next.ffmpeg;
                                         ipc(&view, "ffmpegPath", &settings.ffmpeg);
                                         start_capture(&mut recorder, &mut displays, &settings)?;
@@ -953,17 +1155,25 @@ fn run() -> Result<()> {
                             }
                         }
                         Request::Apply { settings: mut next } => {
-                            ensure!(downloading.is_none() && recorder.can_configure(), "Остановите запись и дождитесь завершения текущей операции.");
+                            ensure!(
+                                downloading.is_none() && recorder.can_configure(),
+                                "Остановите запись и дождитесь завершения текущей операции."
+                            );
                             next.preferences = settings.preferences;
                             next.resume_buffer = settings.resume_buffer;
                             next.validate()?;
                             let changed = next.shortcut != settings.shortcut;
-                            let newly_registered = (changed || !shortcut) && register_shortcut(hwnd, next.shortcut);
+                            let newly_registered =
+                                (changed || !shortcut) && register_shortcut(hwnd, next.shortcut);
                             if let Err(error) = next.write(&directory) {
-                                if newly_registered { unregister_shortcut(hwnd, next.shortcut); }
+                                if newly_registered {
+                                    unregister_shortcut(hwnd, next.shortcut);
+                                }
                                 return Err(error).context("Не удалось сохранить настройки");
                             }
-                            if changed && shortcut { unregister_shortcut(hwnd, settings.shortcut); }
+                            if changed && shortcut {
+                                unregister_shortcut(hwnd, settings.shortcut);
+                            }
                             shortcut = newly_registered || (!changed && shortcut);
                             if settings.output != next.output {
                                 recorder.last = last_clip(&next.output);
@@ -974,12 +1184,15 @@ fn run() -> Result<()> {
                             ipc(&view, "applied", &true);
                         }
                         Request::RefreshDevices => audio_devices(&proxy),
-                        Request::RefreshApplications => ipc(&view, "applications", &applications::running()),
+                        Request::RefreshApplications => {
+                            refresh_applications(&proxy, &mut refreshing_applications)
+                        }
                         Request::CheckUpdate => {
                             if !matches!(update_status, "checking" | "downloading" | "downloaded") {
                                 update_status = "checking";
                                 available_update = None;
-                                next_update_check = Instant::now() + Duration::from_secs(12 * 60 * 60);
+                                next_update_check =
+                                    Instant::now() + Duration::from_secs(12 * 60 * 60);
                                 let proxy = proxy.clone();
                                 std::thread::spawn(move || {
                                     let _ = proxy.send(AppEvent::UpdateChecked(updater::check()));
@@ -1003,7 +1216,9 @@ fn run() -> Result<()> {
                             }
                         }
                         Request::InstallUpdate => {
-                            if recorder.can_configure() && downloading.is_none() && !awaiting_ffmpeg
+                            if recorder.can_configure()
+                                && downloading.is_none()
+                                && !awaiting_ffmpeg
                                 && let Some(update) = staged_update.take()
                             {
                                 if update.install().is_ok() {
@@ -1013,24 +1228,60 @@ fn run() -> Result<()> {
                                 }
                             }
                         }
+                        Request::ReadReleaseNotes => {
+                            if unread_release {
+                                release_notes::mark_read(&directory)
+                                    .context("Не удалось запомнить просмотр истории версий")?;
+                                unread_release = false;
+                            }
+                        }
                         Request::OpenFolder => {
                             fs::create_dir_all(&settings.output)?;
                             launch(settings.output.as_os_str())?;
                         }
-                        Request::OpenClip => launch(recorder.last.as_deref().context("Сначала сохраните клип.")?.as_os_str())?,
-                        Request::OpenOverlay => { let _ = proxy.send(AppEvent::ControlPanel); }
-                        Request::CaptureOverlayShortcut { enabled } => capturing_overlay_shortcut = enabled,
+                        Request::OpenClip => launch(
+                            recorder
+                                .last
+                                .as_deref()
+                                .context("Сначала сохраните клип.")?
+                                .as_os_str(),
+                        )?,
+                        Request::OpenOverlay => {
+                            let _ = proxy.send(AppEvent::ControlPanel);
+                        }
+                        Request::ToggleMicrophone => {
+                            if !quitting {
+                                recorder.toggle_microphone();
+                            }
+                        }
+                        Request::CaptureOverlayShortcut { enabled } => {
+                            capturing_overlay_shortcut = enabled
+                        }
                         Request::OverlayShortcut { shortcut } => {
                             capturing_overlay_shortcut = false;
                             let previous = settings.preferences.overlay_shortcut;
                             let update = (|| -> Result<()> {
-                                ensure!(shortcut.valid(), "Выберите сочетание с Alt, Ctrl, Shift или Win.");
-                                if previous == shortcut && overlay_hotkey.is_some() { return Ok(()); }
-                                let id = if overlay_hotkey == Some(control_panel::HOTKEY) { control_panel::HOTKEY_ALT } else { control_panel::HOTKEY };
-                                ensure!(control_panel::register(hwnd, id, shortcut), "Это сочетание занято или зарезервировано Windows.");
+                                ensure!(
+                                    shortcut.valid(),
+                                    "Выберите сочетание с Alt, Ctrl, Shift или Win."
+                                );
+                                if previous == shortcut && overlay_hotkey.is_some() {
+                                    return Ok(());
+                                }
+                                let id = if overlay_hotkey == Some(control_panel::HOTKEY) {
+                                    control_panel::HOTKEY_ALT
+                                } else {
+                                    control_panel::HOTKEY
+                                };
+                                ensure!(
+                                    control_panel::register(hwnd, id, shortcut),
+                                    "Это сочетание занято или зарезервировано Windows."
+                                );
                                 let mut preferences = settings.preferences;
                                 preferences.overlay_shortcut = shortcut;
-                                if let Err(error) = save_preferences(&directory, &mut settings, preferences) {
+                                if let Err(error) =
+                                    save_preferences(&directory, &mut settings, preferences)
+                                {
                                     let _ = unsafe { UnregisterHotKey(Some(hwnd), id) };
                                     return Err(error);
                                 }
@@ -1039,19 +1290,30 @@ fn run() -> Result<()> {
                                 }
                                 Ok(())
                             })();
-                            let error = update.err().map(|error| locale.text(&format!("{error:#}")).into_owned());
-                            ipc(&view, "overlayShortcut", &json!({"shortcut": settings.preferences.overlay_shortcut, "registered": overlay_hotkey.is_some(), "error": error}));
+                            let error = update
+                                .err()
+                                .map(|error| locale.text(&format!("{error:#}")).into_owned());
+                            ipc(
+                                &view,
+                                "overlayShortcut",
+                                &json!({"shortcut": settings.preferences.overlay_shortcut, "registered": overlay_hotkey.is_some(), "error": error}),
+                            );
                         }
-                        Request::OpenRepository => launch(OsStr::new(env!("CARGO_PKG_REPOSITORY")))?,
+                        Request::OpenRepository => {
+                            launch(OsStr::new(env!("CARGO_PKG_REPOSITORY")))?
+                        }
                         Request::Save => {}
                     }
                     Ok(())
                 })(),
                 AppEvent::Tick => Ok(()),
             };
+            suspend_overlay_hotkey.set(quitting || capturing_overlay_shortcut);
             let mut capture_failed = false;
             if due {
-                if ready && !quitting && settings.preferences.auto_update
+                if ready
+                    && !quitting
+                    && settings.preferences.auto_update
                     && !matches!(update_status, "checking" | "downloading" | "downloaded")
                     && Instant::now() >= next_update_check
                 {
@@ -1065,12 +1327,31 @@ fn run() -> Result<()> {
                 let saved = recorder.tick(|message| capture_error = Some(message.to_owned()));
                 capture_failed = capture_error.is_some();
                 match (capture_error, saved) {
-                    (Some(message), _) => notify(&mut overlay, locale, Notice::RecordingFailed, &message),
-                    (None, Some(SaveOutcome::Saved)) => {
-                        let name = recorder.last.as_deref().and_then(Path::file_name).and_then(|name| name.to_str());
-                        notify(&mut overlay, locale, Notice::Saved, name.unwrap_or("Клип появился в папке сохранения."));
+                    (Some(message), _) => {
+                        notify(&mut overlay, locale, Notice::RecordingFailed, &message)
                     }
-                    (None, Some(SaveOutcome::Failed)) => notify(&mut overlay, locale, Notice::Failed, recorder.error.as_deref().unwrap_or("Ошибка сохранения файла.")),
+                    (None, Some(SaveOutcome::Saved)) => {
+                        let name = recorder
+                            .last
+                            .as_deref()
+                            .and_then(Path::file_name)
+                            .and_then(|name| name.to_str());
+                        notify(
+                            &mut overlay,
+                            locale,
+                            Notice::Saved,
+                            name.unwrap_or("Клип появился в папке сохранения."),
+                        );
+                    }
+                    (None, Some(SaveOutcome::Failed)) => notify(
+                        &mut overlay,
+                        locale,
+                        Notice::Failed,
+                        recorder
+                            .error
+                            .as_deref()
+                            .unwrap_or("Ошибка сохранения файла."),
+                    ),
                     (None, None) => {}
                 }
             }
@@ -1088,8 +1369,19 @@ fn run() -> Result<()> {
             let mut status = recorder.status();
             if !quitting && !capture_failed {
                 match (previous_phase, status.phase) {
-                    ("starting", "recording") => notify(&mut overlay, locale, Notice::BufferStarted, "Идёт запись"),
-                    ("stopping", "idle") => notify(&mut overlay, locale, Notice::BufferStopped, if status.seconds > 0.0 { "Накопленный повтор можно сохранить." } else { "Запись остановлена" }),
+                    ("starting", "recording") => {
+                        notify(&mut overlay, locale, Notice::BufferStarted, "Идёт запись")
+                    }
+                    ("stopping", "idle") => notify(
+                        &mut overlay,
+                        locale,
+                        Notice::BufferStopped,
+                        if status.seconds > 0.0 {
+                            "Накопленный повтор можно сохранить."
+                        } else {
+                            "Запись остановлена"
+                        },
+                    ),
                     _ => {}
                 }
             }
@@ -1099,49 +1391,98 @@ fn run() -> Result<()> {
                 buffer_active = active;
                 settings.resume_buffer = active;
                 if let Err(error) = settings.write(&directory) {
-                    recorder.error = Some(format!("Не удалось запомнить состояние буфера: {error:#}"));
+                    recorder.error =
+                        Some(format!("Не удалось запомнить состояние буфера: {error:#}"));
                     status = recorder.status();
                 }
             }
             if let Some(stop) = &downloading {
-                if quitting { stop.store(true, Ordering::Relaxed); }
+                if quitting {
+                    stop.store(true, Ordering::Relaxed);
+                }
                 status.phase = "downloading";
             }
             let locale = settings.preferences.language.resolve();
             let local_error = status.error.map(|error| locale.text(error));
             status.error = local_error.as_deref();
             if ready {
-                ipc(&view, "status", &UiStatus { capture: &status, download: ffmpeg_progress });
+                ipc(
+                    &view,
+                    "status",
+                    &UiStatus {
+                        capture: &status,
+                        download: ffmpeg_progress,
+                    },
+                );
                 if new_frontend || (update_status, update_progress) != update_before {
-                    ipc(&view, "updateState", &json!({
-                        "state": update_status,
-                        "version": available_update.as_ref().map(|update| &update.version),
-                        "progress": update_progress,
-                    }));
+                    ipc(
+                        &view,
+                        "updateState",
+                        &json!({
+                            "state": update_status,
+                            "version": available_update.as_ref().map(|update| &update.version),
+                            "progress": update_progress,
+                        }),
+                    );
                 }
             }
             if let Some(panel) = &mut tray_panel {
-                panel.update(&status, status.limit.unwrap_or(settings.seconds), shortcut.then_some(settings.shortcut), locale, ffmpeg_progress);
+                panel.update(
+                    &status,
+                    status.limit.unwrap_or(settings.seconds),
+                    shortcut.then_some(settings.shortcut),
+                    locale,
+                    ffmpeg_progress,
+                );
             }
-            if let Some(panel) = &mut control {
+            if let Some(panel) = control.as_mut() {
                 panel.update(&status, &settings, locale, ffmpeg_progress);
             }
-            if let Some(toggle) = &fallback_toggle {
+            if let Some((toggle, microphone)) = &fallback_toggle {
                 let (label, enabled) = tray_panel::buffer_control(status.phase, status.saving);
-                if fallback_state != Some((label, enabled, locale)) {
+                let muted = status.microphone_muted;
+                if fallback_state != Some((label, enabled, locale, muted)) {
                     let _ = toggle.set_text(locale.text(label));
                     let _ = toggle.set_enabled(enabled);
-                    fallback_state = Some((label, enabled, locale));
+                    let _ = microphone.set_text(locale.text(if muted {
+                        "Включить микрофон"
+                    } else {
+                        "Заглушить микрофон"
+                    }));
+                    fallback_state = Some((label, enabled, locale, muted));
                 }
             }
             if quitting && !status.saving && downloading.is_none() {
                 unregister_shortcut(hwnd, settings.shortcut);
-                if let Some(id) = overlay_hotkey { let _ = unsafe { UnregisterHotKey(Some(hwnd), id) }; }
+                if let Some(id) = overlay_hotkey {
+                    let _ = unsafe { UnregisterHotKey(Some(hwnd), id) };
+                }
                 app.exit(0);
                 break;
             }
         }
     });
+    EVENT_PUMP.set(Some(pump));
+    app.run_return(move |_, event| {
+        if let RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::CloseRequested { api, .. },
+            ..
+        } = event
+        {
+            api.prevent_close();
+            let event = match label.as_str() {
+                "tray" => AppEvent::DismissTray,
+                control_panel::LABEL => AppEvent::DismissControl,
+                _ => AppEvent::CloseMain,
+            };
+            let _ = close_proxy.send(event);
+        }
+        process_events();
+    });
+    drop((keep_ticking, window_events));
+    EVENT_PUMP.set(None);
+    drop(lock);
     Ok(())
 }
 
@@ -1159,6 +1500,28 @@ fn main() {
             )
         };
     }
+}
+
+#[cfg(test)]
+#[test]
+fn navigation_requires_the_bundled_origin_and_the_windows_own_page() -> Result<()> {
+    let panel = &["/control.html"];
+    assert!(local_page(
+        &tauri::Url::parse("http://tauri.localhost/control.html")?,
+        panel,
+    ));
+    for address in [
+        "http://tauri.localhost/tray.html",
+        "http://tauri.localhost:8080/control.html",
+        "https://tauri.localhost/control.html",
+        "http://example.test/control.html",
+    ] {
+        assert!(
+            !local_page(&tauri::Url::parse(address)?, panel),
+            "{address}"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

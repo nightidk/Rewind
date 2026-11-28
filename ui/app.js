@@ -2,6 +2,7 @@ import { language, localize, t } from "./i18n.js";
 import { setupTooltips } from "./tooltips.js";
 import { downloadLabel, renderDownload } from "./ffmpeg-progress.js";
 import { overlayPositionKey } from "./overlay-layout.js";
+import { renderMicrophone } from "./microphone.js";
 
 const icons = {
   rewind: '<path fill="currentColor" stroke="none" d="M11 5v14L2 12l9-7Zm10 0v14l-9-7 9-7Z"/>',
@@ -47,6 +48,8 @@ let settings;
 let ffmpegEdited = false;
 let applications = [];
 let update = { state: "idle", version: null };
+let releaseHistory = [];
+let unreadRelease = null;
 let shortcut = true;
 let saving = false;
 let phase = "idle";
@@ -211,7 +214,7 @@ function fill(config, displays) {
     }
     return option;
   }));
-  const chosen = config.automatic_capture || config.mode === "gdi" ? config.display : 0;
+  const chosen = config.automatic_capture || config.mode !== "dxgi" ? config.display : 0;
   setOption(gdi, chosen, "Монитор недоступен");
   $("#tracks").replaceChildren();
   for (const track of config.tracks) addTrack(track);
@@ -284,6 +287,36 @@ function refreshControls() {
 
 function showUpdate() {
   if (!document.querySelector("dialog[open]")) $("#update-prompt").showModal();
+}
+
+function showReleaseNotes(version = null) {
+  if (document.querySelector("dialog[open]")) return;
+  const releases = version ? releaseHistory.filter((release) => release.version === version) : releaseHistory;
+  if (!releases.length) return;
+
+  const list = $("#release-notes-list");
+  list.replaceChildren(...releases.map(({ version, changes }) => {
+    const section = document.createElement("section");
+    const heading = document.createElement("h3");
+    heading.textContent = "v" + version;
+    const bullets = document.createElement("ul");
+    for (const change of changes) {
+      const item = document.createElement("li");
+      item.textContent = t(change).replace(/`([^`]+)`/g, "$1");
+      bullets.append(item);
+    }
+    section.append(heading, bullets);
+    return section;
+  }));
+  onText("#release-notes-title", t(version ? "Что нового" : "История версий"));
+  const dialog = $("#release-notes");
+  dialog.dataset.version = version ?? "";
+  dialog.showModal();
+  list.scrollTop = 0;
+}
+
+function showUnreadRelease() {
+  if (unreadRelease && !document.hidden) showReleaseNotes(unreadRelease);
 }
 
 function refreshUpdate() {
@@ -488,6 +521,12 @@ window.rewind = {
     refreshUpdate();
     if (result.state === "available") showUpdate();
   },
+  releaseNotes({ history, unread }) {
+    releaseHistory = history;
+    unreadRelease = unread;
+    $("#open-release-notes").disabled = !history.length;
+    showUnreadRelease();
+  },
   preferencesSaveError() {
     onText("#preferences-feedback", t("Не удалось сохранить настройки"));
   },
@@ -573,6 +612,7 @@ window.rewind = {
   },
   status(state) {
     lastStatus = state;
+    renderMicrophone(state.microphone_muted);
     phase = state.phase;
     saving = state.saving;
     if (phase !== "idle" || saving || state.error) pendingAction = false;
@@ -671,6 +711,15 @@ $("#update-prompt").addEventListener("submit", (event) => {
     ipc("download_update");
   }
 });
+$("#open-release-notes").addEventListener("click", () => showReleaseNotes());
+$("#release-notes").addEventListener("close", (event) => {
+  if (event.target.dataset.version) {
+    unreadRelease = null;
+    ipc("read_release_notes");
+  }
+});
+all("dialog").forEach((dialog) => dialog.addEventListener("close", showUnreadRelease));
+document.addEventListener("visibilitychange", showUnreadRelease);
 document.querySelector('.tab[data-page="audio"]').addEventListener("click", () => ipc("refresh_applications"));
 field("mode").addEventListener("change", mode);
 field("automatic_capture").addEventListener("change", mode);

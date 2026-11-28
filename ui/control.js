@@ -1,5 +1,6 @@
 import { localize, t } from "./i18n.js";
 import { downloadLabel, renderDownload } from "./ffmpeg-progress.js";
+import { renderMicrophone } from "./microphone.js";
 import { overlayPositionKey } from "./overlay-layout.js";
 import { setupTooltips } from "./tooltips.js";
 
@@ -159,8 +160,9 @@ window.rewind = {
   opened() {
     restorePositions();
   },
-  status({ locale, phase, seconds, limit, saving, toggle_label, toggle_enabled, settings, download }) {
+  status({ locale, phase, seconds, limit, saving, microphone_muted, toggle_label, toggle_enabled, settings, download }) {
     localize(locale);
+    renderMicrophone(microphone_muted);
     pinLabel();
     document.body.dataset.phase = phase;
     const downloading = phase === "downloading";

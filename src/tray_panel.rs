@@ -1,36 +1,27 @@
-use std::cell::Cell;
-
-use crate::{ffmpeg::Progress, ipc, localization::Locale, recorder::Status};
+use crate::window_events::DismissOutside;
+use crate::{ffmpeg::Progress, ipc, local_page, localization::Locale, recorder::Status};
 use anyhow::{Result, ensure};
 use serde::Serialize;
 use std::path::PathBuf;
 use tauri::webview::{Color, NewWindowResponse};
 use tauri::{App, PhysicalPosition, Theme, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, PtInRect,
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_ESCAPE,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetWindowRect, HC_ACTION, HHOOK, HWND_TOPMOST, MA_NOACTIVATE, MSLLHOOKSTRUCT,
-    PA_NOACTIVATE, PostMessageW, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetWindowPos,
-    SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, WH_MOUSE_LL, WM_CLOSE, WM_HOTKEY,
-    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_POINTERACTIVATE, WM_RBUTTONDOWN,
-    WM_XBUTTONDOWN,
+    HWND_TOPMOST, MA_NOACTIVATE, PA_NOACTIVATE, PostMessageW, SW_HIDE, SWP_NOACTIVATE,
+    SWP_SHOWWINDOW, SetWindowPos, ShowWindow, WM_CLOSE, WM_HOTKEY, WM_MOUSEACTIVATE,
+    WM_POINTERACTIVATE,
 };
-use windows::core::PCWSTR;
 
 const WIDTH: f64 = 328.0;
 const HEIGHT: f64 = 270.0;
 const ESCAPE_HOTKEY: i32 = 1;
-
-thread_local! {
-    static OPEN_MENU: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
-}
 
 #[derive(PartialEq, Eq, Serialize)]
 struct PanelStatus {
@@ -39,6 +30,7 @@ struct PanelStatus {
     seconds: u32,
     limit: u32,
     saving: bool,
+    microphone_muted: bool,
     shortcut: Option<u32>,
     toggle_label: &'static str,
     toggle_enabled: bool,
@@ -58,7 +50,7 @@ pub struct TrayPanel {
     view: WebviewWindow,
     hwnd: HWND,
     last: Option<PanelStatus>,
-    outside_clicks: Option<HHOOK>,
+    outside_clicks: Option<DismissOutside>,
     escape_registered: bool,
 }
 
@@ -77,9 +69,7 @@ impl TrayPanel {
             .always_on_top(true)
             .data_directory(webview_data)
             .background_color(Color(10, 10, 11, 255))
-            .on_navigation(|url| {
-                url.host_str() == Some("tauri.localhost") && url.path() == "/tray.html"
-            })
+            .on_navigation(|url| local_page(url, &["/tray.html"]))
             .on_new_window(|_, _| NewWindowResponse::Deny)
             .disable_drag_drop_handler()
             .build()?;
@@ -140,20 +130,7 @@ impl TrayPanel {
             .is_ok();
         }
         if self.outside_clicks.is_none() {
-            self.outside_clicks = unsafe {
-                GetModuleHandleW(PCWSTR::null()).and_then(|module| {
-                    SetWindowsHookExW(
-                        WH_MOUSE_LL,
-                        Some(dismiss_on_outside_click),
-                        Some(HINSTANCE(module.0)),
-                        0,
-                    )
-                })
-            }
-            .ok();
-            if self.outside_clicks.is_some() {
-                OPEN_MENU.set(hwnd);
-            }
+            self.outside_clicks = DismissOutside::watch(hwnd).ok();
         }
         self.reveal();
         Ok(())
@@ -178,10 +155,7 @@ impl TrayPanel {
             let _ = unsafe { UnregisterHotKey(Some(self.hwnd), ESCAPE_HOTKEY) };
             self.escape_registered = false;
         }
-        if let Some(hook) = self.outside_clicks.take() {
-            OPEN_MENU.set(HWND::default());
-            let _ = unsafe { UnhookWindowsHookEx(hook) };
-        }
+        self.outside_clicks = None;
     }
 
     pub fn update(
@@ -202,6 +176,7 @@ impl TrayPanel {
             seconds: status.seconds.min(f64::from(limit)) as u32,
             limit,
             saving: status.saving,
+            microphone_muted: status.microphone_muted,
             shortcut,
             toggle_label,
             toggle_enabled,
@@ -241,25 +216,6 @@ unsafe extern "system" fn panel_message(
         }
         _ => unsafe { DefSubclassProc(window, message, wp, lp) },
     }
-}
-
-unsafe extern "system" fn dismiss_on_outside_click(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32
-        && matches!(
-            wp.0 as u32,
-            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
-        )
-    {
-        let window = OPEN_MENU.get();
-        let mut bounds = RECT::default();
-        if !window.is_invalid() && unsafe { GetWindowRect(window, &mut bounds) }.is_ok() {
-            let click = unsafe { &*(lp.0 as *const MSLLHOOKSTRUCT) }.pt;
-            if !unsafe { PtInRect(&bounds, click) }.as_bool() {
-                let _ = unsafe { PostMessageW(Some(window), WM_CLOSE, WPARAM(0), LPARAM(0)) };
-            }
-        }
-    }
-    unsafe { CallNextHookEx(None, code, wp, lp) }
 }
 
 fn panel_bounds(point: POINT, work: RECT, scale: f64) -> RECT {

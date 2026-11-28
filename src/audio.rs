@@ -387,7 +387,12 @@ pub struct Feed {
 }
 
 impl Feed {
-    pub fn spawn(settings: &Settings, synthetic: bool, tag: &str) -> Result<Option<Self>> {
+    pub fn spawn(
+        settings: &Settings,
+        synthetic: bool,
+        tag: &str,
+        microphone_muted: Arc<AtomicBool>,
+    ) -> Result<Option<Self>> {
         let system = settings.active_tracks().any(|(_, enabled, _)| enabled);
         let mic = settings.active_tracks().any(|(_, _, enabled)| enabled);
         let apps: Vec<String> = settings
@@ -433,6 +438,7 @@ impl Feed {
                 &ids,
                 &apps,
                 synthetic,
+                &microphone_muted,
             )
         });
         Ok(Some(Self {
@@ -477,6 +483,7 @@ fn run_feed(
     ids: &[Option<String>; 2],
     apps: &[String],
     synthetic: bool,
+    microphone_muted: &AtomicBool,
 ) -> Result<()> {
     let _com = Com::new()?;
     struct AudioPriority(HANDLE);
@@ -579,6 +586,7 @@ fn run_feed(
             continue;
         }
         let mut peak = 0;
+        let mute_mic = microphone_muted.load(Ordering::Relaxed);
         for (index, row) in data.chunks_exact_mut(frame_bytes).enumerate() {
             let position = cursor + index as i64;
             for (source, bytes) in row.chunks_exact_mut(4).enumerate() {
@@ -597,6 +605,11 @@ fn run_feed(
                         .as_mut()
                         .map_or([0; 2], |input| input.queue.sample(position))
                 };
+                let sample = if mute_mic && source == 1 {
+                    [0; 2]
+                } else {
+                    sample
+                };
                 peak = peak
                     .max(sample[0].unsigned_abs())
                     .max(sample[1].unsigned_abs());
@@ -614,6 +627,32 @@ fn run_feed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn muting_writes_silent_mic_channels_without_interrupting_the_feed() -> Result<()> {
+        let settings = Settings {
+            microphone_device: "default".into(),
+            ..Settings::default()
+        };
+        let muted = Arc::new(AtomicBool::new(true));
+        let feed = Feed::spawn(&settings, true, "microphone-mute-test", Arc::clone(&muted))?
+            .context("Missing loopback and microphone feed")?;
+        let mut input = std::fs::File::open(&feed.name)?;
+        let mut block = [0; BLOCK * 8];
+        input.read_exact(&mut block)?;
+        assert!(block.chunks_exact(8).all(|frame| frame[4..] == [0; 4]));
+        assert!(block.chunks_exact(8).any(|frame| frame[..4] != [0; 4]));
+
+        muted.store(false, Ordering::Relaxed);
+        for _ in 0..10 {
+            input.read_exact(&mut block)?;
+            if block.chunks_exact(8).any(|frame| frame[4..] != [0; 4]) {
+                return Ok(());
+            }
+        }
+        bail!("Microphone did not resume on the same audio feed")
+    }
 
     #[test]
     fn failed_endpoint_retries_without_reopening_the_other_source() {

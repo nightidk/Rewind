@@ -24,7 +24,10 @@
       </div>
       <progress id="buffer" value="0" max="300"></progress>
     </div>
-    <button type="button" class="pill tray-record" id="buffer-toggle" data-action="toggle_buffer" disabled>Включить буфер</button>
+    <div class="tray-transport">
+      <button type="button" class="pill tray-record" id="buffer-toggle" data-action="toggle_buffer" disabled>Включить буфер</button>
+      <button type="button" class="pill mic-toggle" data-action="toggle_microphone" aria-label="Заглушить микрофон" aria-pressed="false" data-tooltip="Заглушить микрофон" disabled></button>
+    </div>
     <button type="button" class="pill primary tray-save" data-action="save" disabled>
       <span id="save-label">Сохранить повтор</span><kbd id="shortcut" hidden></kbd>
     </button>
@@ -34,5 +37,6 @@
       <button type="button" class="pill" data-action="quit">Выйти</button>
     </footer>
   </main>
+  <div id="tooltip" role="tooltip" popover="manual"></div>
 </body>
 </html>

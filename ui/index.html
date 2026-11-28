@@ -64,6 +64,7 @@
             <div class="transport">
               <button type="button" id="primary" class="pill primary"><span id="primary-icon" data-icon="play"></span><span id="primary-text">Включить буфер</span></button>
               <button type="button" id="stop" class="pill" data-action="stop" hidden>Остановить</button>
+              <button type="button" class="pill mic-toggle" data-action="toggle_microphone" aria-label="Заглушить микрофон" aria-pressed="false" data-tooltip="Заглушить микрофон" disabled></button>
               <div class="keys" id="keys" aria-label="Глобальная клавиша сохранения"><kbd>Alt</kbd><kbd id="function-key">F10</kbd></div>
             </div>
           </article>
@@ -93,7 +94,7 @@
             <h2>Захват экрана</h2>
             <fieldset class="fields editable">
               <label class="switch-label wide"><input class="switch" type="checkbox" name="automatic_capture" checked>Автоматический захват с ускорением GPU</label>
-              <label id="mode-field">Способ захвата<select name="mode"><option value="dxgi">DXGI</option><option value="gdi">Совместимый (GDI)</option></select></label>
+              <label id="mode-field">Способ захвата<select name="mode"><option value="wgc">Захват Windows (WGC)</option><option value="dxgi">DXGI</option><option value="gdi">Совместимый (GDI)</option></select></label>
               <label id="dxgi-field">Выход DXGI<input type="number" name="dxgi_display" min="0" max="31" required></label>
               <label id="gdi-field" class="wide" hidden>Монитор<select name="gdi_display"></select></label>
               <label class="switch-label wide"><input class="switch" type="checkbox" name="native_resolution">Родное разрешение экрана</label>
@@ -198,7 +199,10 @@
           </div>
           <div class="update-footer">
             <label><input class="switch" type="checkbox" name="auto_update" checked>Автоматически проверять обновления</label>
-            <button type="button" class="pill repository" data-action="open_repository" aria-label="Репозиторий Rewind на GitHub">GitHub <span aria-hidden="true">↗</span></button>
+            <div class="update-footer-links">
+              <button type="button" id="open-release-notes" class="pill repository" disabled>История версий</button>
+              <button type="button" class="pill repository" data-action="open_repository" aria-label="Репозиторий Rewind на GitHub">GitHub <span aria-hidden="true">↗</span></button>
+            </div>
           </div>
         </section>
       </section>
@@ -237,6 +241,13 @@
         <button type="submit" class="pill" value="later" autofocus>Позже</button>
         <button type="submit" class="pill primary" value="download">Скачать</button>
       </div>
+    </form>
+  </dialog>
+  <dialog id="release-notes" class="prompt release-notes" aria-labelledby="release-notes-title">
+    <h2 id="release-notes-title">История версий</h2>
+    <div id="release-notes-list" role="region" aria-labelledby="release-notes-title" tabindex="0"></div>
+    <form method="dialog" class="prompt-actions">
+      <button type="submit" class="pill primary" autofocus>Закрыть</button>
     </form>
   </dialog>
 </body>

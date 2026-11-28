@@ -1,0 +1,6 @@
+{
+  "identifier": "tray-panel",
+  "description": "Commands for the Rewind tray menu.",
+  "windows": ["tray"],
+  "permissions": ["allow-tray-action"]
+}

@@ -127,6 +127,7 @@ impl ExportCodec {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureMode {
+    Wgc,
     Dxgi,
     Gdi,
 }

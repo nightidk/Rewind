@@ -1,6 +1,8 @@
+use std::cell::Cell;
 use std::mem::size_of;
+use std::rc::Rc;
 
-use anyhow::{Context, Result};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use tauri::webview::{Color, NewWindowResponse};
 use tauri::{AppHandle, Theme, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
@@ -9,14 +11,18 @@ use crate::ffmpeg::Progress;
 use crate::localization::Locale;
 use crate::recorder::Status;
 use crate::settings::{ExportCodec, OverlayShortcut, Settings};
-use crate::{ipc, tray_panel::buffer_control};
-use windows::Win32::Foundation::HWND;
+use crate::window_events::DismissOutside;
+use crate::{ipc, local_page, tray_panel::buffer_control};
+use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, HWND_TOPMOST, IsWindowVisible, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+    GetForegroundWindow, HWND_TOPMOST, IsWindowVisible, SW_HIDE, SWP_SHOWWINDOW,
     SetForegroundWindow, SetWindowPos, ShowWindow,
 };
 
@@ -66,25 +72,99 @@ struct State {
     seconds: u32,
     limit: u32,
     saving: bool,
+    microphone_muted: bool,
     toggle_label: &'static str,
     toggle_enabled: bool,
     settings: QuickSettings,
     download: Option<Progress>,
 }
 
+#[derive(Default)]
+pub struct OverlayWindow {
+    hwnd: Cell<HWND>,
+    previous_window: Cell<HWND>,
+    outside_clicks: Cell<Option<DismissOutside>>,
+}
+
+impl OverlayWindow {
+    pub fn available(&self) -> bool {
+        !self.hwnd.get().is_invalid()
+    }
+
+    fn visible(&self) -> bool {
+        unsafe { IsWindowVisible(self.hwnd.get()) }.as_bool()
+    }
+
+    pub fn toggle(&self) -> Result<()> {
+        if self.visible() {
+            self.hide();
+            return Ok(());
+        }
+        let hwnd = self.hwnd.get();
+        let monitor = unsafe { MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY) };
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        ensure!(
+            unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool(),
+            "Не удалось определить основной экран."
+        );
+        let bounds = info.rcMonitor;
+        unsafe {
+            self.previous_window.set(GetForegroundWindow());
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                bounds.left,
+                bounds.top,
+                bounds.right - bounds.left,
+                bounds.bottom - bounds.top,
+                SWP_SHOWWINDOW,
+            )?;
+            if GetForegroundWindow() != hwnd {
+                let _ = SetForegroundWindow(hwnd);
+            }
+        }
+        self.outside_clicks.set(DismissOutside::watch(hwnd).ok());
+        Ok(())
+    }
+
+    fn hide(&self) {
+        self.outside_clicks.set(None);
+        let previous = self.previous_window.take();
+        if !self.visible() {
+            return;
+        }
+        let hwnd = self.hwnd.get();
+        unsafe {
+            // Hide the whole native surface even when the WebView is waiting to paint.
+            let restore_focus = GetForegroundWindow() == hwnd;
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            if restore_focus && previous != hwnd && IsWindowVisible(previous).as_bool() {
+                let _ = SetForegroundWindow(previous);
+            }
+        }
+    }
+}
+
 pub struct ControlPanel {
     view: WebviewWindow,
-    hwnd: HWND,
+    window: Rc<OverlayWindow>,
     last: Option<State>,
-    previous_window: HWND,
 }
 
 impl ControlPanel {
-    pub fn new(app: &AppHandle, data: std::path::PathBuf) -> Result<Self> {
+    pub fn new(
+        app: &AppHandle,
+        data: std::path::PathBuf,
+        window: Rc<OverlayWindow>,
+    ) -> Result<Self> {
         let view = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("control.html".into()))
             .title("Оверлей Rewind")
             .theme(Some(Theme::Dark))
             .visible(false)
+            .focused(false)
             .decorations(false)
             .resizable(false)
             .transparent(true)
@@ -93,9 +173,7 @@ impl ControlPanel {
             .always_on_top(true)
             .data_directory(data)
             .background_color(Color(0, 0, 0, 0))
-            .on_navigation(|url| {
-                url.host_str() == Some("tauri.localhost") && url.path() == "/control.html"
-            })
+            .on_navigation(|url| local_page(url, &["/control.html"]))
             .on_new_window(|_, _| NewWindowResponse::Deny)
             .disable_drag_drop_handler()
             .build()?;
@@ -109,58 +187,38 @@ impl ControlPanel {
                 size_of::<i32>() as u32,
             )
         };
+        window.hwnd.set(hwnd);
         Ok(Self {
             view,
-            hwnd,
+            window,
             last: None,
-            previous_window: HWND::default(),
         })
     }
 
-    pub fn toggle(&mut self) -> Result<()> {
-        if unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
-            self.hide();
-        } else {
-            let monitor = self
-                .view
-                .primary_monitor()?
-                .context("Не удалось определить основной экран.")?;
+    pub fn finish_toggle(&mut self) {
+        if self.window.visible() {
+            let _ = self.view.as_ref().show();
+            self.focus_webview();
             self.refresh();
             ipc(&self.view, "opened", &true);
-            self.previous_window = unsafe { GetForegroundWindow() };
-            unsafe {
-                SetWindowPos(
-                    self.hwnd,
-                    Some(HWND_TOPMOST),
-                    monitor.position().x,
-                    monitor.position().y,
-                    i32::try_from(monitor.size().width)?,
-                    i32::try_from(monitor.size().height)?,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                )?;
-                let _ = SetForegroundWindow(self.hwnd);
-            }
+        } else {
+            let _ = self.view.as_ref().hide();
         }
-        Ok(())
     }
 
     pub fn hide(&mut self) {
-        let previous = std::mem::take(&mut self.previous_window);
-        unsafe {
-            if !IsWindowVisible(self.hwnd).as_bool() {
-                return;
-            }
-            // Hide the whole native surface even when the WebView is waiting to paint.
-            let restore_focus = GetForegroundWindow() == self.hwnd;
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
-            if restore_focus && previous != self.hwnd && IsWindowVisible(previous).as_bool() {
-                let _ = SetForegroundWindow(previous);
-            }
-        }
+        self.window.hide();
+        let _ = self.view.as_ref().hide();
     }
 
     pub fn refresh(&mut self) {
         self.last = None;
+    }
+
+    pub fn focus_webview(&self) {
+        if unsafe { GetForegroundWindow() } == self.window.hwnd.get() {
+            let _ = self.view.as_ref().set_focus();
+        }
     }
 
     pub fn applied(&self, error: Option<&str>) {
@@ -174,7 +232,7 @@ impl ControlPanel {
         locale: Locale,
         download: Option<Progress>,
     ) {
-        if !unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
+        if !self.window.visible() {
             return;
         }
         let (toggle_label, toggle_enabled) = buffer_control(status.phase, status.saving);
@@ -189,6 +247,7 @@ impl ControlPanel {
             seconds: status.seconds.min(f64::from(limit)) as u32,
             limit,
             saving: status.saving,
+            microphone_muted: status.microphone_muted,
             toggle_label,
             toggle_enabled,
             settings: QuickSettings::from(settings),

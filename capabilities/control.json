@@ -1,0 +1,6 @@
+{
+  "identifier": "control-panel",
+  "description": "Commands for the Rewind overlay.",
+  "windows": ["control"],
+  "permissions": ["allow-control-action"]
+}

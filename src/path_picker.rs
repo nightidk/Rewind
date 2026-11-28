@@ -29,9 +29,6 @@ pub async fn browse_path(
     kind: PathKind,
     current: PathBuf,
 ) -> std::result::Result<Option<PathBuf>, String> {
-    if window.label() != "main" {
-        return Err("Команда доступна в главном окне.".into());
-    }
     let owner = window.hwnd().map_err(|error| error.to_string())?.0 as isize;
     tauri::async_runtime::spawn_blocking(move || unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
